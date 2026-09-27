@@ -1,0 +1,22 @@
+build/
+build-asan/
+build-*/
+*.so
+*.o
+*.gcda
+*.gcno
+*.gcov
+luacov.stats.out
+luacov.report.out
+leak-logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
+
+# Local test scratch
+tmp/

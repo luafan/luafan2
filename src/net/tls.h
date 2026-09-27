@@ -1,0 +1,57 @@
+/*
+ * tls.h — LuaFan v2 TLS support (OpenSSL) for client (and later server) sockets.
+ *
+ * Compiled unconditionally; the OpenSSL-dependent body is guarded by
+ * FAN_WITH_OPENSSL. When OpenSSL is disabled, fan_tls_client_bev returns NULL
+ * with an explanatory error and fan.tls advertises available=false.
+ *
+ * The TLS connection reuses tcp.c's bufferevent connection model: we only
+ * differ in how the bufferevent is constructed (bufferevent_openssl_socket_new
+ * with a per-connection SSL over an SSL_CTX). Read/write/drain/close all flow
+ * through the same tcp_conn_t machinery.
+ */
+#ifndef FAN2_NET_TLS_H
+#define FAN2_NET_TLS_H
+
+#include <lua.h>
+#include <event2/bufferevent.h>
+
+/* One-time process init (OpenSSL algorithms, default verify paths). Safe to
+ * call repeatedly. No-op when OpenSSL is disabled. */
+void fan_tls_init(void);
+
+/* Whether TLS is compiled in. */
+int fan_tls_available(void);
+
+/* Build a client-side TLS bufferevent (fd = -1, to be connected via
+ * bufferevent_socket_connect_hostname). Applies SNI + optional peer/host
+ * verification for `host`. On failure returns NULL and, if err is non-NULL,
+ * sets *err to a static/borrowed message. Returns NULL when OpenSSL is off. */
+struct bufferevent *fan_tls_client_bev(struct event_base *base,
+                                       const char *host,
+                                       int verify_peer,
+                                       int verify_host,
+                                       const char **err);
+
+/* ---- server side --------------------------------------------------------- */
+
+/* Build a server SSL context from a PEM cert + key file pair. Returns an
+ * opaque handle (owned by the caller; must be freed with
+ * fan_tls_server_ctx_free) or NULL with *err set. NULL when OpenSSL is off. */
+void *fan_tls_server_ctx_new(const char *cert_path, const char *key_path,
+                             const char **err);
+
+/* Free a server SSL context returned by fan_tls_server_ctx_new. NULL is a
+ * no-op. Safe to call from any thread that owns the ctx. */
+void  fan_tls_server_ctx_free(void *ctx);
+
+/* Wrap an accepted socket fd in a server-side TLS bufferevent using ctx.
+ * On failure returns NULL and, if err is non-NULL, sets *err. Returns NULL
+ * when OpenSSL is off. */
+struct bufferevent *fan_tls_server_bev(struct event_base *base, int fd,
+                                       void *ctx, const char **err);
+
+/* Register the fan.tls table on the module at stack top (-1). */
+void fan_tls_register(lua_State *L);
+
+#endif /* FAN2_NET_TLS_H */

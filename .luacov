@@ -1,0 +1,39 @@
+-- .luacov — configuration for LuaCov (Lua coverage tool).
+--
+-- Only files under this project's lua/ tree count. Third-party rocks
+-- (luacov itself, luafan2 test framework, ad-hoc scripts) are excluded.
+--
+-- Stats + report artifacts live under build-coverage/ so they never mix
+-- with source and are trivially cleanable / gitignorable.
+return {
+    -- ---- collection --------------------------------------------------------
+    statsfile     = "build-coverage/luacov.stats.out",
+    reportfile    = "build-coverage/luacov.report.out",
+    -- Flush stats on every process exit (each test runs a fresh ./fan).
+    savestepsize  = 100,
+    tick          = false,
+
+    -- ---- what counts as project source ------------------------------------
+    -- Patterns are Lua patterns matched against source paths. `include`
+    -- gates first, then `exclude` prunes.
+    include = {
+        "lua/fan/",
+        "lua/fan$",           -- lua/fan.lua (if it exists in the future)
+    },
+    exclude = {
+        "/luacov",             -- luacov's own modules
+        "/luacov/",
+        "tests/",              -- tests are not "code we measure"
+        "tests/lua/framework", -- test framework helpers
+    },
+
+    -- ---- reporter ----------------------------------------------------------
+    -- Default reporter emits a plain text report. HTML is not built here;
+    -- run_tests.sh runs luacov + a small summary script and (optionally)
+    -- lcov's genhtml over the C side. Lua stays plain-text for simplicity.
+    reporter = "default",
+
+    -- Deletion happens explicitly in run_tests.sh --coverage before each
+    -- run, so we don't want luacov to auto-delete mid-run.
+    deletestats = false,
+}
