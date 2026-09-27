@@ -615,6 +615,35 @@ static int server_gc(lua_State *L) {
     return 0;
 }
 
+/*
+ * fan_tcp_clear_lua_state — teardown hook invoked immediately before the
+ * owning `lua_close(L)`. NULLs out the cached main-thread pointer so any
+ * libevent callback that fires between lua_close and fan_loop_cleanup
+ * sees a well-defined sentinel instead of dereferencing dangling memory.
+ *
+ * Paired with the `if (!L)` early-return in server_accept_cb (above at
+ * line ~473): with g_main_L == NULL, an accepted socket is closed
+ * without touching Lua and the connection is quietly dropped. This is
+ * the luafan2 counterpart of v1's problem-12 fix (see the v1 tests
+ * test_tcpd_cleanup_mainthread.lua and test_http_client_timer_linger.lua
+ * for the exact regression class).
+ *
+ * KNOWN GAP (do not silently "fix" without a plan): the guard covers
+ * server_accept_cb only. conn_wake -> fan_coro_wake and
+ * conn_drain_writecb still touch g_main_L directly (see
+ * fan_coro_wake in runtime/coro.c: luaL_unref(main_L, ...)). Currently
+ * safe because the three real callers (main.c teardown paths) invoke
+ * this hook after fan_loop_run has returned and before lua_close, so
+ * no wake / drain callback can fire. If a future caller inverts that
+ * order, or a __gc-driven bufferevent_free ends up synchronously
+ * firing a pending write callback, that path will UAF. The
+ * incremental fix is to push a `if (!main_L) return;` into
+ * fan_coro_wake (covers all 8 modules that cache g_*_L in one edit).
+ *
+ * Contract tested in tests/c/unit/test_tcp_clear_lua_state.c:
+ * idempotent, safe before any register(), and reversible via a
+ * subsequent fan_tcp_register(L_new).
+ */
 void fan_tcp_clear_lua_state(void) {
     g_main_L = NULL;
 }
