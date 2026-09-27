@@ -1,6 +1,6 @@
 # luafan2/Dockerfile.release.alpine
 # ---------------------------------------------------------------------------
-# Release runtime image for LuaFan v2 on Alpine 3.16 (musl libc).
+# Release runtime image for LuaFan v2 on Alpine 3.20 (musl libc, LTS).
 #
 # Same two-stage layout as Dockerfile.release.ubuntu. Alpine has some
 # musl-specific quirks that v2 already handles (see luafan2 sources):
@@ -9,14 +9,19 @@
 #     + a runtime `__progname` symbol probe).
 #   - sysconf(_SC_OPEN_MAX) replaces getdtablesize(2) (v1 macro path)
 #     because musl doesn't expose the latter.
-#   - fan.tls / fan.http/httpd use system OpenSSL 3.x (Alpine 3.16 ships
-#     openssl 1.1.1w; both are handled by the same OpenSSL 1.1+ API
-#     shim in src/net/tls.c).
+#   - fan.tls / fan.http/httpd use system OpenSSL 3.x (alpine 3.20
+#     ships openssl 3.3.x — same major line as ubuntu 22.04's openssl
+#     3.0.x; both go through the same OpenSSL 3-compatible shim in
+#     src/net/tls.c).
 #
 # Alpine coverage status (as of M14.E on arm1): normal build 508/508
 # green under musl aarch64. ASan not run on musl (LSan has known
-# false-positives on musl 1.2.2 with global-tls destructors — CI only
+# false-positives on musl 1.2.5 with global-tls destructors — CI only
 # runs ASan on ubuntu glibc).
+#
+# Why not alpine:3.16? EOL 2024-05, main apk repo missing several
+# runtime packages by 2025+ (libssl1.1 in particular was removed).
+# Alpine 3.20 is the current LTS and stays supported until 2026-04.
 #
 # Build:  docker build -f Dockerfile.release.alpine -t luafan/luafan2-alpine:local .
 # Run:    docker run --rm -it -v $PWD:/w -w /w luafan/luafan2-alpine:local your_script.lua
@@ -25,16 +30,16 @@
 # ==================================================================
 # Stage 1: builder
 # ==================================================================
-FROM alpine:3.16 AS builder
+FROM alpine:3.20 AS builder
 
 # apk (not apt). Alpine package names diverge from Ubuntu:
 #   lua5.3 / lua5.3-dev  (ships liblua-5.3.so.0 and headers)
 #   libevent-dev         (2.1.x static + dynamic)
-#   openssl-dev          (1.1.1w on 3.16 — this is the OpenSSL 1.1
-#                         path in our tls.c, exercised by CI green)
+#   openssl-dev          (openssl 3.3.x on alpine 3.20 — same major
+#                         line as ubuntu 22.04, exercised green by CI)
 #   sqlite-dev
 #   mariadb-connector-c-dev  (libmariadb; matches Ubuntu's libmariadb3)
-#   curl-dev             (libcurl 7.83)
+#   curl-dev             (libcurl 8.x on 3.20)
 #   zlib-dev
 RUN apk add --no-cache \
         build-base \
@@ -72,17 +77,21 @@ RUN test -x /src/build/fan \
 # ==================================================================
 # Stage 2: runtime
 # ==================================================================
-FROM alpine:3.16 AS runtime
+FROM alpine:3.20 AS runtime
 
 # Runtime-only apk packages. Package names WITHOUT -dev suffix, and
 # note that on Alpine several .so's ship in the base package rather
-# than a split -runtime one (unlike Debian/Ubuntu).
+# than a split -runtime one (unlike Debian/Ubuntu). openssl 3.x on
+# alpine 3.20 ships libssl.so.3 + libcrypto.so.3 via the base
+# `openssl` (bin) + `libssl3` + `libcrypto3` packages — the last two
+# are what `ldd fan` actually needs at load time.
 RUN apk add --no-cache \
         lua5.3 \
         libevent \
         libevent-openssl \
         libevent-pthreads \
-        libssl1.1 libcrypto1.1 \
+        libssl3 \
+        libcrypto3 \
         zlib \
         sqlite-libs \
         mariadb-connector-c \
