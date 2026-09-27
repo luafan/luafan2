@@ -9,8 +9,8 @@ Docker Hub once main is green.
 | File                          | Image tag                       | Purpose               | Size (typ.) |
 |-------------------------------|---------------------------------|-----------------------|-------------|
 | `tests/Dockerfile`            | `luafan2-ci:local`              | CI + local test image | ~450 MB     |
-| `Dockerfile.release.ubuntu`   | `luafan/luafan2-ubuntu:<tag>`   | Runtime, glibc        | ~120 MB     |
-| `Dockerfile.release.alpine`   | `luafan/luafan2-alpine:<tag>`   | Runtime, musl         | ~40 MB      |
+| `Dockerfile.release.ubuntu`   | `luafan/luafan2-ubuntu:<tag>`   | Runtime, glibc        | ~60 MB      |
+| `Dockerfile.release.alpine`   | `luafan/luafan2-alpine:<tag>`   | Runtime, musl         | ~18 MB      |
 
 `tests/Dockerfile` is a **fat** image: build toolchain, `mariadb-server`,
 `luarocks`, `luacov`, `lcov`, `gdb`/`valgrind`. It is used by
@@ -21,7 +21,7 @@ runtime — no compilers, no headers, no rocks. See
 Both release images are multi-stage:
 1. **builder** — full `-dev` packages (apt on ubuntu, apk on alpine) →
    `cmake --build --target fan -DCMAKE_BUILD_TYPE=Release` → `strip`.
-2. **runtime** — stock base image (`ubuntu:22.04` / `alpine:3.16`) +
+2. **runtime** — stock base image (`ubuntu:22.04` / `alpine:3.20.10`) +
    the exact runtime `.so` packages that match `ldd fan`. `fan` binary
    installed to `/usr/local/bin/fan`, Lua modules to
    `/usr/local/share/lua/5.3/`. `ENTRYPOINT = ["/usr/local/bin/fan"]`,
@@ -38,18 +38,48 @@ missing, the image build fails there rather than shipping broken.
 
 ### Alpine musl notes
 
-Alpine 3.16 runs against musl 1.2.2 and OpenSSL 1.1.1w. Known v2
+Alpine 3.20 runs against musl 1.2.5 and OpenSSL 3.3.x. Known v2
 adaptations (already in-tree):
 
 - `setprogname()` — Linux-glibc-only; `src/sys/posix.c` uses a
   nil-returning stub gated by a runtime `__progname` probe.
 - `sysconf(_SC_OPEN_MAX)` replaces `getdtablesize(2)` (v1 macro path).
 - OpenSSL 1.1.1 / 3.x are both handled by the shim in `src/net/tls.c`.
+- `<sys/queue.h>` — musl does not ship the BSD queue header;
+  `src/net/httpd.c` uses `TAILQ_INIT`. `Dockerfile.release.alpine`
+  builder stage installs `libbsd-dev` to get the NetBSD-compat
+  header. Headers-only — the macros expand at compile time, so the
+  runtime image does not link against `libbsd`.
+- Alpine 3.20's `libevent` main package now includes the openssl and
+  pthreads adapter shared libraries (`libevent_openssl-2.1.so.7`,
+  `libevent_pthreads-2.1.so.7`); the standalone `libevent-openssl`
+  and `libevent-pthreads` subpackages that existed on 3.16 no longer
+  exist. Runtime `apk add` lists `libevent` only.
+- `lua5.3-dev` on alpine installs the linker symlink at
+  `/usr/lib/lua5.3/liblua.so` (subdir) rather than
+  `/usr/lib/liblua5.3.so`. `CMakeLists.txt` `find_library` includes
+  `lua5.3` / `lua5.4` in `PATH_SUFFIXES` for this reason.
+
+Why alpine 3.20 (not 3.16)? Alpine 3.16 hit EOL 2024-05 and by 2025+
+its apk repo had dropped `libssl1.1` / `libcrypto1.1`, so
+`apk add libssl1.1 libcrypto1.1` failed with "no such package".
+3.20 is the current LTS through 2026-04 and ships openssl 3.3.x —
+same major line as ubuntu 22.04, exercised by the same OpenSSL-3
+shim in `src/net/tls.c`.
+
+Alpine base image is pinned by patch (`alpine:3.20.10`), matching
+v1's pinning style (v1 uses `alpine:3.16.9`).
 
 ASan is **not** exercised on Alpine — LSan has known false-positives on
-musl 1.2.2 around global-TLS destructors. CI only runs ASan on the
+musl around global-TLS destructors. CI only runs ASan on the
 glibc/ubuntu leg. Alpine coverage: normal mode 508/508 green on arm1
 aarch64 (see M14.E status).
+
+Verified end-to-end on arm1 (native aarch64, docker 29.5, buildkit
+v0.30) via `docker build --no-cache --pull -f Dockerfile.release.alpine`
+and `docker pull luafan/luafan2-alpine:latest` → `docker run … -v` →
+`LuaFan 2.0.0-dev (Lua 5.3.6)`; module surface smoke passes; final
+image size 18.4 MB.
 
 ## Workflows
 
@@ -99,8 +129,11 @@ For each of `ubuntu` and `alpine`:
   (`push-by-digest=true`, `name-canonical=true`); no human-facing tag
   yet. Digest is exported as an empty file to
   `/tmp/digests/<hex>` and uploaded as an artifact
-  (`digests-<flavour>-<arch>`). GHA cache is scoped
-  `release-<flavour>-<arch>` (mode=max).
+  (`digests-<flavour>-<arch>`). Build runs with `no-cache: true` +
+  `pull: true` (cold-build, matching v1's `docker-push.yml`).
+  Release images are infrequent post-CI events; a full rebuild each
+  time is safer than risking GHA cache poisoning across base-image
+  bumps. CI (`ci.yml`) still caches its per-commit builds.
 - **`merge-<flavour>`** downloads both digests, runs
   `docker buildx imagetools create` to assemble a multi-arch manifest,
   and pushes under the real tags:
