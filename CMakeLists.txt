@@ -64,10 +64,16 @@ find_path(LUA_INCLUDE_DIR lua.h
     PATH_SUFFIXES lua5.3 lua5.4 lua luajit-2.1 luajit-2.0
     PATHS /usr/include /usr/local/include /opt/homebrew/include
 )
+# NOTE on Alpine: apk's lua5.3-dev installs the linker symlink as
+# /usr/lib/lua5.3/liblua.so (a subdir under /usr/lib), not the more
+# common /usr/lib/liblua5.3.so. Include `lua5.3` / `lua5.4` in the
+# PATH_SUFFIXES so find_library recurses one level deeper on Alpine.
+# On Debian/Ubuntu the file is at /usr/lib/<triplet>/liblua5.3.so and
+# is picked up via the arch-specific suffixes below — no regression.
 find_library(LUA_LIBRARY
     NAMES lua5.3 lua5.4 lua lua-5.3 lua-5.4 luajit-5.1
     PATHS /usr/lib /usr/local/lib /opt/homebrew/lib
-    PATH_SUFFIXES x86_64-linux-gnu aarch64-linux-gnu
+    PATH_SUFFIXES lua5.3 lua5.4 x86_64-linux-gnu aarch64-linux-gnu
 )
 if(NOT LUA_INCLUDE_DIR)
     message(FATAL_ERROR "Lua headers not found (need lua.h)")

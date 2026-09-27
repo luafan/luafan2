@@ -41,6 +41,11 @@ FROM alpine:3.20.10 AS builder
 #   mariadb-connector-c-dev  (libmariadb; matches Ubuntu's libmariadb3)
 #   curl-dev             (libcurl 8.x on 3.20)
 #   zlib-dev
+#   libbsd-dev           (musl doesn't ship <sys/queue.h>; libbsd-dev
+#                         provides the BSD compat header, used by
+#                         src/net/httpd.c for TAILQ_* macros. Headers
+#                         only — the macros are compile-time, no
+#                         runtime linkage against libbsd is required.)
 RUN apk add --no-cache \
         build-base \
         cmake \
@@ -52,7 +57,8 @@ RUN apk add --no-cache \
         zlib-dev \
         sqlite-dev \
         mariadb-connector-c-dev \
-        curl-dev
+        curl-dev \
+        libbsd-dev
 
 WORKDIR /src
 COPY . /src
@@ -81,15 +87,24 @@ FROM alpine:3.20.10 AS runtime
 
 # Runtime-only apk packages. Package names WITHOUT -dev suffix, and
 # note that on Alpine several .so's ship in the base package rather
-# than a split -runtime one (unlike Debian/Ubuntu). openssl 3.x on
-# alpine 3.20 ships libssl.so.3 + libcrypto.so.3 via the base
-# `openssl` (bin) + `libssl3` + `libcrypto3` packages — the last two
-# are what `ldd fan` actually needs at load time.
+# than a split -runtime one (unlike Debian/Ubuntu).
+#
+# libevent: alpine 3.20's libevent-2.1.12-r7 main package already
+# includes libevent_openssl-2.1.so.7 and libevent_pthreads-2.1.so.7
+# (verified via `apk info -L libevent` on aarch64). The separate
+# `libevent-openssl` and `libevent-pthreads` subpackages that existed
+# on alpine 3.16 were merged back into the main package sometime
+# between 3.16 and 3.20. Listing the (now non-existent) subpackages
+# in `apk add` fails with "no such package" — regression witnessed
+# on both amd64 and arm64 in CI, root cause of the 3-second alpine
+# build failure. Just install `libevent` and everything is there.
+#
+# openssl 3.x on alpine 3.20 ships libssl.so.3 + libcrypto.so.3 via
+# `libssl3` + `libcrypto3` — the two libraries `ldd fan` needs at
+# load time.
 RUN apk add --no-cache \
         lua5.3 \
         libevent \
-        libevent-openssl \
-        libevent-pthreads \
         libssl3 \
         libcrypto3 \
         zlib \
