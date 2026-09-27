@@ -90,8 +90,10 @@ jobs:
           # push-by-digest: no tag yet; merge job below assembles the
           # multi-arch manifest under the human-facing tags.
           outputs: type=image,name=luafan/luafan2-ubuntu,push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=release-ubuntu-${{ matrix.arch }}
-          cache-to:   type=gha,scope=release-ubuntu-${{ matrix.arch }},mode=max
+          # See alpine build below for rationale — release image is a
+          # cold-build every time (mirrors v1 docker-push.yml).
+          no-cache: true
+          pull: true
 
       - name: Export digest
         run: |
@@ -199,8 +201,13 @@ jobs:
           file: Dockerfile.release.alpine
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=luafan/luafan2-alpine,push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=release-alpine-${{ matrix.arch }}
-          cache-to:   type=gha,scope=release-alpine-${{ matrix.arch }},mode=max
+          # No GHA cache for release image builds: cache poisoning from a
+          # previous failed build (alpine 3.16 apk index → 3.20 layout)
+          # caused 3-second cache-hydration crashes. v1 does the same
+          # (docker-push.yml). Release builds are infrequent (post-CI),
+          # so a full rebuild each time is the safe trade-off.
+          no-cache: true
+          pull: true
 
       - name: Export digest
         run: |
