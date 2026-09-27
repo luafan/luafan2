@@ -52,6 +52,23 @@ void fan_coro_wake(lua_State *main_L, lua_State *co, int ref, int nargs) {
         luaL_unref(main_L, LUA_REGISTRYINDEX, ref);
     }
 }
+
+lua_State *fan_coro_main(lua_State *L) {
+    if (!L) return NULL;
+#if LUA_VERSION_NUM >= 502
+    /* registry[LUA_RIDX_MAINTHREAD] is the state's main thread: it is created
+     * with the state and released only by lua_close, so it can never be
+     * collected while module callbacks are armed (unlike the coroutine that
+     * happened to run `require`). */
+    lua_State *m;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
+    m = lua_tothread(L, -1);
+    lua_pop(L, 1);
+    return m ? m : L;
+#else
+    return L;
+#endif
+}
 /* A parked sleep: holds the strong ref to the coroutine + its timer event. */
 typedef struct {
     lua_State  *L;          /* main state (owns the registry) */

@@ -33,10 +33,10 @@
 #endif
 #if FAN_WITH_MARIADB
 #include "db/db_mariadb.h"
+#endif
 
 #include "sys/posix.h"
 #include "sys/popen.h"
-#endif
 
 #include <lua.h>
 #include <lauxlib.h>

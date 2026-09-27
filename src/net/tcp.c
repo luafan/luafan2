@@ -57,7 +57,10 @@ static void conn_set_err(tcp_conn_t *c, const char *msg) {
     c->err = msg ? strdup(msg) : NULL;
 }
 
-/* main lua_State, stashed at module load, used to unref from callbacks. */
+/* Main thread of the owning lua_State, stashed at module load, used to unref /
+ * resume from libevent callbacks. MUST be the state's main thread (see
+ * fan_coro_main): the thread that runs `require "fan"` is usually a throwaway
+ * coroutine that can be collected while our callbacks are still armed. */
 static lua_State *g_main_L = NULL;
 
 /* push a new conn userdata wrapping bev; leaves it on top of L */
@@ -467,6 +470,10 @@ static void server_accept_cb(struct evconnlistener *listener, evutil_socket_t fd
 
     /* create the connection coroutine: on_accept(conn) */
     lua_State *L = g_main_L;
+    if (!L) {
+        bufferevent_free(bev);
+        return;
+    }
     lua_State *co = lua_newthread(L);
     /* pin the coroutine across its run */
     lua_pushvalue(L, -1);
@@ -608,6 +615,10 @@ static int server_gc(lua_State *L) {
     return 0;
 }
 
+void fan_tcp_clear_lua_state(void) {
+    g_main_L = NULL;
+}
+
 /* ---- registration --------------------------------------------------------- */
 static const luaL_Reg conn_methods[] = {
     {"send",         l_send},
@@ -635,7 +646,7 @@ static const luaL_Reg tcp_funcs[] = {
 };
 
 void fan_tcp_register(lua_State *L) {
-    g_main_L = L;  /* remember the main state for cross-callback unref */
+    g_main_L = fan_coro_main(L);  /* stable main thread, not the require() coroutine */
 
     /* conn metatable */
     luaL_newmetatable(L, TCP_CONN_MT);

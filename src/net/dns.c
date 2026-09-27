@@ -170,7 +170,7 @@ static const luaL_Reg dns_funcs[] = {
 };
 
 void fan_dns_register(lua_State *L) {
-    g_dns_L = L;
+    g_dns_L = fan_coro_main(L);  /* stable main thread, not the require() coroutine */
     lua_newtable(L);
 #if LUA_VERSION_NUM >= 502
     luaL_setfuncs(L, dns_funcs, 0);

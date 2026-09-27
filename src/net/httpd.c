@@ -69,10 +69,13 @@
 
 #define FAN_HTTPD_SERVER_MT  "fan.httpd_c.server"
 #define FAN_HTTPD_REQUEST_MT "fan.httpd_c.request"
+#define FAN_HTTPD_HEADERS_MT "fan.httpd_c.headers"
 
-/* Main Lua state, stashed at module load. evhttp callbacks fire from libevent
- * with no state pointer of their own, so we resume every handler on the main
- * state's registry (the same pattern fan.tcp uses). */
+/* Main thread of the owning lua_State, stashed at module load. evhttp callbacks
+ * fire from libevent with no state pointer of their own, so we resume every
+ * handler on the main state's registry (the same pattern fan.tcp uses). This
+ * MUST be the state's main thread (fan_coro_main), never the coroutine that
+ * happened to run `require "fan"`. */
 static lua_State *g_main_L = NULL;
 
 /* ---- server userdata ---------------------------------------------------- */
@@ -285,11 +288,47 @@ static void push_query_table(lua_State *L, const char *qs) {
     }
 }
 
+/* __index for req.headers: keys are stored lowercased (the documented v2
+ * shape), but v1 code looked headers up with their wire spelling
+ * ("If-None-Match", "Accept-Encoding"), so retry with a lowercased key. */
+static int l_headers_lookup(lua_State *L) {
+    if (lua_type(L, 2) != LUA_TSTRING) {
+        lua_pushnil(L);
+        return 1;
+    }
+    size_t len = 0;
+    const char *k = lua_tolstring(L, 2, &len);
+    char stackbuf[128];
+    char *low = (len + 1 <= sizeof(stackbuf)) ? stackbuf : (char *)malloc(len + 1);
+    if (!low) {
+        lua_pushnil(L);
+        return 1;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)k[i];
+        low[i] = (char)((c >= 'A' && c <= 'Z') ? (c + 32) : c);
+    }
+    low[len] = '\0';
+    lua_pushlstring(L, low, len);
+    lua_rawget(L, 1);
+    if (low != stackbuf) free(low);
+    return 1;
+}
+
 /* Push a Lua table with all request headers, lowercased keys, per v1 shape.
  * Duplicate headers get folded with ", " (matches parse_request in the Lua
- * backend and RFC 7230 §3.2.2). */
+ * backend and RFC 7230 §3.2.2). A metatable makes lookups case-insensitive. */
 static void push_headers_table(lua_State *L, struct evkeyvalq *hs) {
     lua_newtable(L);
+    /* v1 parity: header reads stay case-insensitive (see l_headers_lookup). */
+    luaL_getmetatable(L, FAN_HTTPD_HEADERS_MT);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        luaL_newmetatable(L, FAN_HTTPD_HEADERS_MT);
+        lua_pushcfunction(L, l_headers_lookup);
+        lua_setfield(L, -2, "__index");
+    }
+    lua_setmetatable(L, -2);
     if (!hs) return;
     struct evkeyval *kv;
     for (kv = hs->tqh_first; kv; kv = kv->next.tqe_next) {
@@ -409,6 +448,39 @@ static void request_fill_fields(lua_State *L, int req_idx, struct evhttp_request
         lua_setfield(L, -2, "query");
     }
 
+    /* params (v1 shape): the query string merged with an
+     * application/x-www-form-urlencoded body — v1 ran evhttp_parse_query_str
+     * over both, in this order, so the form body wins on collisions. Values
+     * are always strings, matching v1. */
+    {
+        const char *qmark = strchr(uri, '?');
+        push_query_table(L, qmark ? qmark + 1 : "");
+        httpd_request_t *rq = (httpd_request_t *)lua_touserdata(L, req_idx);
+        const char *ctype = evhttp_find_header(
+            evhttp_request_get_input_headers(ev), "Content-Type");
+        if (ctype && strstr(ctype, "application/x-www-form-urlencoded") == ctype &&
+            rq->body && rq->body_len > 0) {
+            char *form = (char *)malloc(rq->body_len + 1);
+            if (form) {
+                memcpy(form, rq->body, rq->body_len);
+                form[rq->body_len] = '\0';
+                push_query_table(L, form);
+                free(form);
+                int fidx = lua_gettop(L);   /* form table */
+                int pidx = fidx - 1;        /* params table (just below) */
+                lua_pushnil(L);
+                while (lua_next(L, fidx) != 0) {
+                    lua_pushvalue(L, -2);   /* key */
+                    lua_pushvalue(L, -2);   /* value */
+                    lua_rawset(L, pidx);    /* params[key] = value */
+                    lua_pop(L, 1);          /* keep the key for lua_next */
+                }
+                lua_pop(L, 1);              /* drop the form table */
+            }
+        }
+        lua_setfield(L, -2, "params");
+    }
+
     /* headers */
     push_headers_table(L, evhttp_request_get_input_headers(ev));
     lua_setfield(L, -2, "headers");
@@ -461,11 +533,13 @@ static void copy_headers(struct evkeyvalq *dst, struct evkeyvalq *src) {
 static int commit_headers(lua_State *L, httpd_request_t *r, int headers_idx) {
     struct evkeyvalq *out = evhttp_request_get_output_headers(r->ev);
 
+    /* v1 callers pass a reason-phrase string in this slot
+     * (:reply(status, message, body) / :reply_start(status, message)); any
+     * non-table value is ignored so both call shapes work. */
     /* 1 + 2: seed with pending, then knock out anything the caller
      * overrides. We do the removal BEFORE pushing pending to `out` so we
      * only need to walk pending_headers once. */
-    if (headers_idx != 0 && !lua_isnoneornil(L, headers_idx)) {
-        luaL_checktype(L, headers_idx, LUA_TTABLE);
+    if (headers_idx != 0 && lua_type(L, headers_idx) == LUA_TTABLE) {
         lua_pushnil(L);
         while (lua_next(L, headers_idx) != 0) {
             if (lua_type(L, -2) == LUA_TSTRING) {
@@ -483,7 +557,7 @@ static int commit_headers(lua_State *L, httpd_request_t *r, int headers_idx) {
         copy_headers(out, &r->pending_headers);
     }
     /* Then push caller-supplied headers. */
-    if (headers_idx != 0 && !lua_isnoneornil(L, headers_idx)) {
+    if (headers_idx != 0 && lua_type(L, headers_idx) == LUA_TTABLE) {
         lua_pushnil(L);
         while (lua_next(L, headers_idx) != 0) {
             if (lua_type(L, -2) == LUA_TSTRING && lua_isstring(L, -1)) {
@@ -1647,7 +1721,7 @@ static const luaL_Reg httpd_funcs[] = {
 };
 
 void fan_httpd_register(lua_State *L) {
-    g_main_L = L;
+    g_main_L = fan_coro_main(L);  /* stable main thread, not the require() coroutine */
 
     /* Request metatable. We route __index through a C dispatch so
      * `req.method` (uservalue lookup) and `req:reply(...)` (method table

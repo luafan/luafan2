@@ -145,6 +145,16 @@ local function parse_request(reader)
     end
   end
 
+  -- v1 parity: header lookups are case-insensitive even though keys are
+  -- stored lowercased (v2 shape). v1 kept the wire spelling, so handlers
+  -- reading req.headers["If-None-Match"] must keep working.
+  setmetatable(headers, {
+    __index = function(t, k)
+      if type(k) == "string" then return rawget(t, k:lower()) end
+      return nil
+    end,
+  })
+
   local body = ""
   local clen = tonumber(headers["content-length"])
   if clen and clen > 0 then
@@ -157,6 +167,16 @@ local function parse_request(reader)
   -- ever needed. HTTP/1.1 permits us to refuse unsupported TE.
 
   local path, qs = split_path_query(target)
+  local query = parse_query(qs)
+  -- v1 parity: req.params is the query string merged with an
+  -- application/x-www-form-urlencoded body (v1 ran evhttp_parse_query_str
+  -- over both); later entries win. Values are always strings.
+  local params = {}
+  for k, v in pairs(query) do params[k] = v end
+  local ctype = headers["content-type"]
+  if ctype and ctype:find("application/x-www-form-urlencoded", 1, true) == 1 then
+    for k, v in pairs(parse_query(body)) do params[k] = v end
+  end
   -- v1 fan.httpd's request object exposes :read() / :available() so
   -- streaming handlers can drain the body incrementally. Our body has
   -- already been fully read into a Lua string, so these methods just
@@ -167,7 +187,8 @@ local function parse_request(reader)
     method = method:upper(),
     path = path,
     target = target,        -- raw request-target incl. query
-    query = parse_query(qs),
+    query = query,
+    params = params,
     headers = headers,
     body = body,
     http_version = ver,
@@ -349,12 +370,20 @@ local function build_head(status, reason, headers, extra_lines)
   return table.concat(out, "\r\n") .. "\r\n\r\n"
 end
 
--- one-shot reply: status, headers table, body string
+-- v1 callers use :reply(status, message, body) and :reply_start(status,
+-- message): the second argument is a reason-phrase string, not a header
+-- table. Ignore any non-table value so both call shapes work.
+local function normalize_headers(headers)
+  if headers ~= nil and type(headers) ~= "table" then return nil end
+  return headers
+end
+
+-- one-shot reply: status, headers table, body string (v1: status, message, body)
 function Response:reply(status, headers, body)
   if self.sent_head then error("reply: response head already sent", 2) end
   body = body or ""
   local reason = reason_for(status)
-  headers = merged_headers(self, headers)
+  headers = merged_headers(self, normalize_headers(headers))
   local h = {}
   local have_cl, have_conn = false, false
   if headers then
@@ -379,7 +408,7 @@ end
 function Response:reply_start(status, headers)
   if self.sent_head then error("reply_start: response head already sent", 2) end
   local reason = reason_for(status)
-  headers = merged_headers(self, headers)
+  headers = merged_headers(self, normalize_headers(headers))
   local h = {}
   local have_te, have_conn = false, false
   if headers then

@@ -11,6 +11,7 @@
  *     when omitted it is inferred from bind_host, defaulting to "inet".
  *   sock:sendto(data, host, port)  -> true | nil, err  (host numeric, matches family)
  *   sock:recv()                     -> data, host, port | nil, err  (yields)
+ *   sock:getport()                  -> local bound port number | nil
  *   sock:join(group)                -> true | nil, err  (IPv4 or IPv6 multicast)
  *   sock:leave(group)               -> true | nil, err
  *   sock:close()

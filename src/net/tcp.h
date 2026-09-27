@@ -18,4 +18,7 @@
 /* Registers fan.tcp onto the module table at stack top (-1). */
 void fan_tcp_register(lua_State *L);
 
+/* Clears callback state before the owning Lua state is closed. */
+void fan_tcp_clear_lua_state(void);
+
 #endif /* FAN2_NET_TCP_H */

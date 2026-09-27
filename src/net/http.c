@@ -754,7 +754,7 @@ static const luaL_Reg http_c_funcs[] = {
 };
 
 void fan_http_register(lua_State *L) {
-    g_main_L = L;
+    g_main_L = fan_coro_main(L);  /* stable main thread, not the require() coroutine */
     /* One-time global init. Idempotent; curl handles refcounting. */
     curl_global_init(CURL_GLOBAL_DEFAULT);
 

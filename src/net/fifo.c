@@ -200,7 +200,7 @@ static const luaL_Reg fifo_funcs[] = {
 };
 
 void fan_fifo_register(lua_State *L) {
-    g_fifo_L = L;
+    g_fifo_L = fan_coro_main(L);  /* stable main thread, not the require() coroutine */
     luaL_newmetatable(L, FIFO_MT);
     lua_pushvalue(L, -1);
     lua_setfield(L, -2, "__index");

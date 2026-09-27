@@ -788,7 +788,7 @@ static const luaL_Reg popen_funcs[] = {
 };
 
 void fan_popen_register(lua_State *L) {
-    g_popen_L = L;
+    g_popen_L = fan_coro_main(L);  /* stable main thread, not the require() coroutine */
     luaL_newmetatable(L, POPEN_MT);
     lua_pushcfunction(L, l_gc);       lua_setfield(L, -2, "__gc");
     lua_pushcfunction(L, l_tostring); lua_setfield(L, -2, "__tostring");

@@ -1209,7 +1209,7 @@ static const luaL_Reg ws_methods[] = {
  * fan.tcp conn objects are exposed and keeps the write-side hot path
  * (send/recv) free of a Lua-table lookup for every method dispatch. */
 void fan_ws_register(lua_State *L) {
-    g_ws_main_L = L;
+    g_ws_main_L = fan_coro_main(L);  /* stable main thread, not the require() coroutine */
     luaL_newmetatable(L, FAN_WS_CONN_MT);
     /* Build the methods table and install it directly as __index. */
     lua_newtable(L);

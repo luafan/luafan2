@@ -33,6 +33,17 @@ int fan_coro_park(lua_State *L);
  * `main_L` owns the registry. */
 void fan_coro_wake(lua_State *main_L, lua_State *co, int ref, int nargs);
 
+/* The main thread of `L`'s global state — i.e. the thread that lives exactly as
+ * long as the lua_State (and therefore owns the registry until lua_close).
+ *
+ * Module loaders MUST use this instead of stashing the `L` they were called
+ * with: `require "fan"` runs on whatever thread (usually a coroutine) first
+ * pulled the module in, and that coroutine can be collected while the module's
+ * libevent callbacks are still armed. Capturing the coroutine there leaves a
+ * dangling lua_State in the callbacks (use-after-free on the next accept /
+ * receive / wake). Returns NULL for a NULL input. */
+lua_State *fan_coro_main(lua_State *L);
+
 /* Register fan.sleep and expose it on the module table at index -1.
  * Requires the loop + a valid main lua_State. */
 void fan_coro_register(lua_State *L);

@@ -264,6 +264,31 @@ static int l_recv(lua_State *L) {
     return lua_yield(L, 0);
 }
 
+/* sock:getport() -> local bound port | nil */
+static int l_getport(lua_State *L) {
+    udp_sock_t *u = (udp_sock_t *)luaL_checkudata(L, 1, UDP_MT);
+    if (u->closed || u->fd < 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    if (getsockname(u->fd, (struct sockaddr *)&ss, &slen) != 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+    if (ss.ss_family == AF_INET) {
+        lua_pushinteger(L, ntohs(((struct sockaddr_in *)&ss)->sin_port));
+    } else if (ss.ss_family == AF_INET6) {
+        lua_pushinteger(L, ntohs(((struct sockaddr_in6 *)&ss)->sin6_port));
+    } else {
+        lua_pushnil(L);
+    }
+    return 1;
+}
+
+/* sock:close() */
 static int l_close(lua_State *L) {
     udp_sock_t *u = (udp_sock_t *)luaL_checkudata(L, 1, UDP_MT);
     if (!u->closed) {
@@ -293,6 +318,7 @@ static int udp_gc(lua_State *L) {
 static const luaL_Reg udp_methods[] = {
     {"sendto", l_sendto},
     {"recv",   l_recv},
+    {"getport", l_getport},
     {"join",   l_join},
     {"leave",  l_leave},
     {"close",  l_close},
@@ -305,7 +331,7 @@ static const luaL_Reg udp_funcs[] = {
 };
 
 void fan_udp_register(lua_State *L) {
-    g_udp_L = L;
+    g_udp_L = fan_coro_main(L);  /* stable main thread, not the require() coroutine */
     luaL_newmetatable(L, UDP_MT);
     lua_pushvalue(L, -1);
     lua_setfield(L, -2, "__index");

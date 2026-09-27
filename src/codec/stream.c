@@ -314,6 +314,31 @@ static int l_reset(lua_State *L) {
     return 0;
 }
 
+/* Luafan v1 compatibility: switch the stream to append mode. Unread bytes are
+ * preserved at the front of the buffer and the read cursor is rewound, so a
+ * following prepare_get() re-decodes the whole (unread + appended) payload. */
+static int l_prepare_add(lua_State *L) {
+    stream_t *s = check_stream(L, 1);
+    if (s->pos > 0) {
+        if (s->pos < s->len) {
+            memmove(s->buf, s->buf + s->pos, s->len - s->pos);
+            s->len -= s->pos;
+        } else {
+            s->len = 0;
+        }
+        s->pos = 0;
+    }
+    return 0;
+}
+
+/* Luafan v1 compatibility: switch to read mode, rewinding to the start of the
+ * buffered payload so decoding sees all pending bytes. */
+static int l_prepare_get(lua_State *L) {
+    stream_t *s = check_stream(L, 1);
+    s->pos = 0;
+    return 0;
+}
+
 /* ---- new / gc ------------------------------------------------------------- */
 static int l_new(lua_State *L) {
     size_t init_len = 0;
@@ -360,6 +385,8 @@ static const luaL_Reg methods[] = {
     {"len",       l_len},
     {"pos",       l_pos},
     {"reset",     l_reset},
+    {"prepare_add", l_prepare_add},
+    {"prepare_get", l_prepare_get},
     {NULL, NULL},
 };
 
