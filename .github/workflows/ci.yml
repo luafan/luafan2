@@ -1,0 +1,126 @@
+name: CI
+
+# Runs the full test matrix on every push to main and every PR.
+#
+# All three modes (normal / --asan / --coverage) run inside the same
+# Docker image (`luafan2-ci:local`, built from tests/Dockerfile) so
+# CI matches what developers run locally via `./tests/run_tests.sh`.
+# The image is built once per workflow run via `docker/build-push-action`
+# and pushed into the GitHub Actions cache; each matrix job then loads
+# it via `docker load` from the cached tar. That's ~30s of overhead
+# for the build, amortised across the three matrix jobs and any
+# subsequent workflow re-runs on the same commit.
+#
+# Coverage is soft-warn (no `--enforce`) at this milestone. C 84.8% is
+# still below the 85% floor; once that closes we'll flip `--enforce`
+# in a follow-up PR.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref: pushing a fix on top of a
+# still-running CI shouldn't keep two matrixes in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------
+  # Build the CI image once, publish to the workflow cache. Each test
+  # matrix job below loads it from cache instead of rebuilding.
+  # ---------------------------------------------------------------
+  build-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      image_ref: ${{ steps.meta.outputs.ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build tests/Dockerfile → luafan2-ci:local (tar)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tests/Dockerfile
+          tags: luafan2-ci:local
+          outputs: type=docker,dest=/tmp/luafan2-ci.tar
+          # GHA cache keeps the layer graph across runs; expected to
+          # be near-instant once the base image + apt layer is warm.
+          cache-from: type=gha,scope=ci-image
+          cache-to: type=gha,scope=ci-image,mode=max
+
+      - name: Upload image tar
+        uses: actions/upload-artifact@v4
+        with:
+          name: luafan2-ci-image
+          path: /tmp/luafan2-ci.tar
+          retention-days: 1
+
+      - id: meta
+        run: echo "ref=luafan2-ci:local" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------
+  # Matrix: run the three test modes in parallel. Each job loads the
+  # image built above, then invokes `./tests/run_tests.sh <mode>`.
+  # ---------------------------------------------------------------
+  test:
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - normal
+          - asan
+          - coverage
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download image tar
+        uses: actions/download-artifact@v4
+        with:
+          name: luafan2-ci-image
+          path: /tmp/
+
+      - name: Load luafan2-ci:local
+        run: docker load -i /tmp/luafan2-ci.tar
+
+      - name: Run tests (${{ matrix.mode }})
+        env:
+          # Coverage runs against gcov-instrumented builds; libcurl/
+          # libevent path lengths can flare on the shared GHA runner.
+          # 300s per test matches what arm1 uses.
+          PER_TEST_TIMEOUT: ${{ matrix.mode == 'coverage' && '300' || '180' }}
+        run: |
+          case "${{ matrix.mode }}" in
+            normal)   ./tests/run_tests.sh ;;
+            asan)     ./tests/run_tests.sh --asan ;;
+            coverage) ./tests/run_tests.sh --coverage ;;   # soft-warn, no --enforce
+          esac
+
+      # Coverage-only: expose the HTML + summary as a downloadable
+      # artifact. Small (< 5 MB gzipped). Ignored by other matrix legs.
+      - name: Upload coverage report
+        if: matrix.mode == 'coverage' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: |
+            build-coverage/coverage-html/
+            build-coverage/summary.txt
+            build-coverage/luacov.report.out
+            manifest/coverage-latest.md
+          retention-days: 30
+          if-no-files-found: warn

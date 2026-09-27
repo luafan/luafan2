@@ -1,0 +1,40 @@
+# luafan2/.dockerignore
+# ---------------------------------------------------------------------------
+# Trim the docker build context so `docker build` doesn't ship the
+# entire test tree, coverage artefacts, and CI caches to the daemon.
+# Anything listed here is NOT sent as part of `docker build .` context,
+# and therefore cannot be COPY'd into any stage.
+#
+# Kept (implicitly): CMakeLists.txt, src/, lua/, README.md, .luacov,
+# and every top-level file the Release build needs.
+# ---------------------------------------------------------------------------
+
+# Build outputs
+build/
+build-asan/
+build-coverage/
+build-*/
+
+# CI test image and test tree — release image is built independently
+# from tests/Dockerfile (the "CI/test" image) and does NOT ship or
+# run the test suite.
+tests/
+
+# Manifest, docs, and CI config — image content, not runtime code.
+manifest/
+docs/
+.github/
+
+# VCS + local scratch
+.git/
+.gitignore
+.dockerignore
+tmp/
+
+# Editor / OS turd
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/

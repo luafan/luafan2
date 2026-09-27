@@ -1,0 +1,102 @@
+# luafan2/Dockerfile.release.alpine
+# ---------------------------------------------------------------------------
+# Release runtime image for LuaFan v2 on Alpine 3.16 (musl libc).
+#
+# Same two-stage layout as Dockerfile.release.ubuntu. Alpine has some
+# musl-specific quirks that v2 already handles (see luafan2 sources):
+#   - setprogname() is Linux-glibc-only; posix.c uses a nil-returning
+#     stub on musl (see src/sys/posix.c, gated by FAN_PLATFORM_LINUX
+#     + a runtime `__progname` symbol probe).
+#   - sysconf(_SC_OPEN_MAX) replaces getdtablesize(2) (v1 macro path)
+#     because musl doesn't expose the latter.
+#   - fan.tls / fan.http/httpd use system OpenSSL 3.x (Alpine 3.16 ships
+#     openssl 1.1.1w; both are handled by the same OpenSSL 1.1+ API
+#     shim in src/net/tls.c).
+#
+# Alpine coverage status (as of M14.E on arm1): normal build 508/508
+# green under musl aarch64. ASan not run on musl (LSan has known
+# false-positives on musl 1.2.2 with global-tls destructors — CI only
+# runs ASan on ubuntu glibc).
+#
+# Build:  docker build -f Dockerfile.release.alpine -t luafan/luafan2-alpine:local .
+# Run:    docker run --rm -it -v $PWD:/w -w /w luafan/luafan2-alpine:local your_script.lua
+# ---------------------------------------------------------------------------
+
+# ==================================================================
+# Stage 1: builder
+# ==================================================================
+FROM alpine:3.16 AS builder
+
+# apk (not apt). Alpine package names diverge from Ubuntu:
+#   lua5.3 / lua5.3-dev  (ships liblua-5.3.so.0 and headers)
+#   libevent-dev         (2.1.x static + dynamic)
+#   openssl-dev          (1.1.1w on 3.16 — this is the OpenSSL 1.1
+#                         path in our tls.c, exercised by CI green)
+#   sqlite-dev
+#   mariadb-connector-c-dev  (libmariadb; matches Ubuntu's libmariadb3)
+#   curl-dev             (libcurl 7.83)
+#   zlib-dev
+RUN apk add --no-cache \
+        build-base \
+        cmake \
+        pkgconfig \
+        ca-certificates \
+        lua5.3-dev \
+        libevent-dev \
+        openssl-dev \
+        zlib-dev \
+        sqlite-dev \
+        mariadb-connector-c-dev \
+        curl-dev
+
+WORKDIR /src
+COPY . /src
+
+# Alpine's lua5.3-dev installs pkg-config metadata under lua5.3.pc;
+# CMake's find_library(NAMES lua5.3 lua-5.3 lua) picks it up without
+# extra hints. Verify explicitly if issues arise:
+#   cmake --debug-find -S /src -B /src/build ...
+RUN cmake -S /src -B /src/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DFAN_WITH_OPENSSL=ON \
+        -DFAN_WITH_ZLIB=ON \
+        -DFAN_WITH_CURL=ON \
+        -DFAN_WITH_SQLITE3=ON \
+        -DFAN_WITH_MARIADB=ON \
+    && cmake --build /src/build -j"$(nproc)" --target fan \
+    && strip /src/build/fan
+
+RUN test -x /src/build/fan \
+ && /src/build/fan -v
+
+# ==================================================================
+# Stage 2: runtime
+# ==================================================================
+FROM alpine:3.16 AS runtime
+
+# Runtime-only apk packages. Package names WITHOUT -dev suffix, and
+# note that on Alpine several .so's ship in the base package rather
+# than a split -runtime one (unlike Debian/Ubuntu).
+RUN apk add --no-cache \
+        lua5.3 \
+        libevent \
+        libevent-openssl \
+        libevent-pthreads \
+        libssl1.1 libcrypto1.1 \
+        zlib \
+        sqlite-libs \
+        mariadb-connector-c \
+        libcurl \
+        ca-certificates
+
+COPY --from=builder /src/build/fan  /usr/local/bin/fan
+COPY --from=builder /src/lua/       /usr/local/share/lua/5.3/
+
+# Same smoke test as the ubuntu image. If any `require` chain assumes
+# glibc-only behavior (unlikely — v2 has explicit musl gates), it will
+# surface here before the image is tagged.
+RUN fan -v \
+ && fan -e "for _, m in ipairs({'fan','fan.compat','fan.utils','fan.log','fan.json','fan.objectbuf','fan.stream','fan.httpd','fan.http','fan.websocket','fan.orm','fan.pool','fan.worker','fan.popen','fan.upnp','fan.reliable_udp','fan.connector','fan.config','config'}) do assert(require(m), m) end print('release image smoke: OK')"
+
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/fan"]

@@ -1,0 +1,263 @@
+name: Release Image
+
+# Publishes two multi-arch runtime images to Docker Hub after CI passes
+# on the main branch (never on PRs, never on failed CI):
+#   luafan/luafan2-ubuntu:latest, :<sha>[, :v<semver>]
+#   luafan/luafan2-alpine:latest, :<sha>[, :v<semver>]
+#
+# Multi-arch build strategy mirrors v1 (docker-push.yml): per-arch job
+# runs on a NATIVE runner (ubuntu-latest for amd64, ubuntu-24.04-arm
+# for arm64), each pushes an image BY DIGEST; a merge job then joins
+# the digests into a single multi-arch manifest under the real tags.
+# Avoids QEMU cross-build's ~5-10x arm64 slowdown.
+#
+# Trigger:
+#   - workflow_run: fires after a successful "CI" run on main, and
+#     only if that run was triggered by a `push` (not a `pull_request`,
+#     since PRs never reach main directly).
+#   - workflow_dispatch: manual re-publish button, e.g. for a tag or
+#     to bake a fresh runtime image without a code change.
+#   - push tags v*: cut a version-tagged image (`:vX.Y.Z`).
+#
+# Requires repository secrets:
+#   DOCKERHUB_USERNAME   Docker Hub account with push access to
+#                        luafan/luafan2-ubuntu and luafan/luafan2-alpine
+#   DOCKERHUB_TOKEN      Docker Hub access token (NOT password)
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------
+  # UBUNTU: per-arch build + merge
+  # -------------------------------------------------------------
+  build-ubuntu:
+    # workflow_run only publishes when CI actually passed AND its
+    # trigger event was a real push (excludes rerun-of-PR CI).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner:   ubuntu-latest
+            arch:     amd64
+          - platform: linux/arm64
+            runner:   ubuntu-24.04-arm
+            arch:     arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      # For workflow_run, checkout the *tested* commit (not HEAD of
+      # main, which could have moved). For push/dispatch, HEAD is
+      # what the user asked for.
+      - name: Checkout tested commit
+        uses: actions/checkout@v4
+        with:
+          ref: >-
+            ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push by digest (ubuntu)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release.ubuntu
+          platforms: ${{ matrix.platform }}
+          # push-by-digest: no tag yet; merge job below assembles the
+          # multi-arch manifest under the human-facing tags.
+          outputs: type=image,name=luafan/luafan2-ubuntu,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=release-ubuntu-${{ matrix.arch }}
+          cache-to:   type=gha,scope=release-ubuntu-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-ubuntu-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-ubuntu:
+    needs: [build-ubuntu]
+    if: needs.build-ubuntu.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-ubuntu-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        env:
+          SHA: >-
+            ${{ github.event.workflow_run.head_sha || github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          tags="-t luafan/luafan2-ubuntu:latest -t luafan/luafan2-ubuntu:${SHA}"
+          if [ "$EVENT_NAME" = "push" ] && [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+              # push of a `v*` tag → also tag :vX.Y.Z
+              tags="$tags -t luafan/luafan2-ubuntu:${REF_NAME}"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - name: Create manifest and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            ${{ steps.tags.outputs.tags }} \
+            $(printf 'luafan/luafan2-ubuntu@sha256:%s ' *)
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect luafan/luafan2-ubuntu:latest
+
+  # -------------------------------------------------------------
+  # ALPINE: per-arch build + merge (parallel to ubuntu)
+  # -------------------------------------------------------------
+  build-alpine:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner:   ubuntu-latest
+            arch:     amd64
+          - platform: linux/arm64
+            runner:   ubuntu-24.04-arm
+            arch:     arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@v4
+        with:
+          ref: >-
+            ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push by digest (alpine)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release.alpine
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=luafan/luafan2-alpine,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=release-alpine-${{ matrix.arch }}
+          cache-to:   type=gha,scope=release-alpine-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-alpine-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-alpine:
+    needs: [build-alpine]
+    if: needs.build-alpine.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-alpine-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        env:
+          SHA: >-
+            ${{ github.event.workflow_run.head_sha || github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          tags="-t luafan/luafan2-alpine:latest -t luafan/luafan2-alpine:${SHA}"
+          if [ "$EVENT_NAME" = "push" ] && [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+              tags="$tags -t luafan/luafan2-alpine:${REF_NAME}"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - name: Create manifest and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            ${{ steps.tags.outputs.tags }} \
+            $(printf 'luafan/luafan2-alpine@sha256:%s ' *)
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect luafan/luafan2-alpine:latest

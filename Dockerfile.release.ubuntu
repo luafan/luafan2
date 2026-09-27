@@ -1,0 +1,125 @@
+# luafan2/Dockerfile.release.ubuntu
+# ---------------------------------------------------------------------------
+# Release runtime image for LuaFan v2 on Ubuntu 22.04.
+#
+# Layout (multi-stage):
+#   1. builder  — full build toolchain + all -dev packages. Produces a
+#                 Release-mode `./fan` executable and copies out only the
+#                 binary + the Lua module tree. Discarded from the final
+#                 image.
+#   2. runtime  — stock ubuntu:22.04 + the exact runtime .so packages
+#                 `./fan` needs (matches `ldd fan`). No compilers, no
+#                 headers, no luarocks, no rocks. Users bring their own
+#                 script; entrypoint is `fan`.
+#
+# Build:   docker build -f Dockerfile.release.ubuntu -t luafan/luafan2-ubuntu:local .
+# Run:     docker run --rm -it -v $PWD:/w -w /w luafan/luafan2-ubuntu:local your_script.lua
+# ---------------------------------------------------------------------------
+
+# ==================================================================
+# Stage 1: builder
+# ==================================================================
+FROM ubuntu:22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LC_ALL=C.UTF-8 LANG=C.UTF-8
+
+# Build deps only. NOTE: intentionally omits gdb/valgrind/strace and
+# lcov/luacov — those belong in tests/Dockerfile (CI image), not in
+# a release build. Ubuntu 22.04's stock apt versions are what CI is
+# already green against:
+#   liblua5.3-dev  liblua5.3-0  (Lua 5.3.6)
+#   libevent-dev   libevent 2.1.12
+#   libssl-dev     OpenSSL 3.0.x
+#   libcurl4-openssl-dev  libcurl 7.81
+#   libsqlite3-dev sqlite3 3.37
+#   libmariadb-dev libmariadb 3.3
+#   zlib1g-dev     zlib 1.2.11
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        pkg-config \
+        ca-certificates \
+        liblua5.3-dev \
+        libevent-dev \
+        libssl-dev \
+        zlib1g-dev \
+        libsqlite3-dev \
+        libmariadb-dev \
+        libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+# Copy in the checkout. Keep it shallow: only what CMake + the runtime
+# need. tests/, docs, and manifests are excluded by .dockerignore
+# (see tests-in-image are unnecessary for release).
+COPY . /src
+
+# Release build. All feature switches ON to match what the CI green
+# tree exercises; -DCMAKE_BUILD_TYPE=Release strips debug symbols and
+# turns on -O2. Parallelism -j is host-CPU-limited, not fixed.
+RUN cmake -S /src -B /src/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DFAN_WITH_OPENSSL=ON \
+        -DFAN_WITH_ZLIB=ON \
+        -DFAN_WITH_CURL=ON \
+        -DFAN_WITH_SQLITE3=ON \
+        -DFAN_WITH_MARIADB=ON \
+    && cmake --build /src/build -j"$(nproc)" --target fan \
+    && strip /src/build/fan
+
+# Fail early if the produced binary is missing anything obvious. `ldd`
+# on the RELEASE image would be too late — the builder image still has
+# all -dev packages that would hide "not found" lines. What we can
+# assert here is that the file exists, is executable, and reports its
+# expected -v banner.
+RUN test -x /src/build/fan \
+ && /src/build/fan -v
+
+# ==================================================================
+# Stage 2: runtime
+# ==================================================================
+FROM ubuntu:22.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LC_ALL=C.UTF-8 LANG=C.UTF-8
+
+# Runtime .so packages only — exactly what `ldd /usr/local/bin/fan`
+# needs after `strip`. If any of these are missing, `fan` fails at
+# dlopen with a clear "libX.so.N: cannot open shared object file"
+# error; if any is extraneous, the image bloats for no reason. This
+# list is derived from the build-time link line (see luafan2/CMakeLists.txt
+# find_library / find_package calls).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        liblua5.3-0 \
+        libevent-2.1-7 \
+        libevent-pthreads-2.1-7 \
+        libevent-openssl-2.1-7 \
+        libssl3 \
+        zlib1g \
+        libsqlite3-0 \
+        libmariadb3 \
+        libcurl4 \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# `fan` binary → /usr/local/bin (already on PATH). Lua modules →
+# /usr/local/share/lua/5.3/ so the built-in Lua package.path finds
+# `require "fan.compat"`, `require "config"`, etc. without any
+# LUA_PATH env-var plumbing on the caller's side.
+COPY --from=builder /src/build/fan       /usr/local/bin/fan
+COPY --from=builder /src/lua/            /usr/local/share/lua/5.3/
+
+# Smoke test: image must at least be able to load fan and every Lua
+# module we ship. If a module has a require chain broken by the copy
+# layout, this catches it at image-build time rather than at first
+# user run.
+RUN fan -v \
+ && fan -e "for _, m in ipairs({'fan','fan.compat','fan.utils','fan.log','fan.json','fan.objectbuf','fan.stream','fan.httpd','fan.http','fan.websocket','fan.orm','fan.pool','fan.worker','fan.popen','fan.upnp','fan.reliable_udp','fan.connector','fan.config','config'}) do assert(require(m), m) end print('release image smoke: OK')"
+
+# Users typically `docker run -v $PWD:/w -w /w luafan/luafan2 script.lua`.
+# Setting WORKDIR here means bare `docker run luafan/luafan2 script.lua`
+# with no volume still runs (script.lua would need to be in the image,
+# which is only useful for embedded distributions).
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/fan"]

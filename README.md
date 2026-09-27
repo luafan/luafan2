@@ -1,5 +1,9 @@
 # LuaFan v2 (second generation)
 
+[![CI](https://github.com/luafan/luafan2/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/luafan/luafan2/actions/workflows/ci.yml)
+[![Docker Ubuntu](https://img.shields.io/docker/v/luafan/luafan2-ubuntu?label=luafan2-ubuntu&logo=docker&sort=semver)](https://hub.docker.com/r/luafan/luafan2-ubuntu)
+[![Docker Alpine](https://img.shields.io/docker/v/luafan/luafan2-alpine?label=luafan2-alpine&logo=docker&sort=semver)](https://hub.docker.com/r/luafan/luafan2-alpine)
+
 Second-generation reimplementation of [LuaFan](https://github.com/luafan/luafan).
 See design docs in the site's `docs/`:
 - `docs/luafan-v1-analysis.md` — analysis of the v1 codebase
@@ -66,6 +70,53 @@ compiler flag namespace and CMake refuses to combine them. Details in
 
 CMake feature options (all OFF by default, flipped on per milestone):
 `-DFAN_WITH_OPENSSL=ON -DFAN_WITH_CURL=ON -DFAN_WITH_MARIADB=ON -DFAN_WITH_WORKER=ON`.
+
+## Docker
+
+Prebuilt release images are published to Docker Hub as multi-arch
+(`linux/amd64` + `linux/arm64`) manifests. Two flavours are available:
+
+| Image                          | Base            | libc  | Size (typ.) |
+|--------------------------------|-----------------|-------|-------------|
+| `luafan/luafan2-ubuntu`        | `ubuntu:22.04`  | glibc | ~120 MB     |
+| `luafan/luafan2-alpine`        | `alpine:3.16`   | musl  | ~40 MB      |
+
+Tags:
+- `latest`         — head of `main` after CI passes
+- `<sha>`          — immutable, pinned to the git commit CI validated
+- `vX.Y.Z`         — pushed when a git tag matching `v*` is created
+
+Both images ship the `fan` executable at `/usr/local/bin/fan` and the
+pure-Lua modules under `/usr/local/share/lua/5.3/`. No `luarocks` or
+third-party rocks are preinstalled — v2's Lua layer is self-contained.
+
+Run a script by bind-mounting the working directory:
+
+```sh
+docker run --rm -v "$PWD:/work" -w /work \
+  luafan/luafan2-ubuntu:latest fan your_script.lua
+```
+
+Quick smoke test:
+
+```sh
+docker run --rm luafan/luafan2-ubuntu:latest \
+  fan -e 'print(require("fan").loop and "ok" or "fail")'
+```
+
+### Building images locally
+
+`build_docker.sh` wraps `docker build` for both flavours:
+
+```sh
+./build_docker.sh both              # builds ubuntu + alpine, tag :local
+./build_docker.sh ubuntu            # only ubuntu
+./build_docker.sh alpine            # only alpine
+TAG=dev ./build_docker.sh ubuntu    # override tag
+```
+
+Design notes and CI/release workflow layout live in
+[`manifest/ci-and-release-image.md`](manifest/ci-and-release-image.md).
 
 ## Status
 
