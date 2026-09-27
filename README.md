@@ -190,11 +190,17 @@ Design notes and CI/release workflow layout live in
     identical tables. Encode buffer is a GC-guarded userdata so a
     luaL_error mid-encode does not leak. 14/14 contract tests.
   - M5.3 fan.stream (C) — `src/codec/stream.c`. Userdata state machine:
-    write buffer + read cursor. AddU/S 8/16/24/32, AddU30 VLQ (1/2/3/5-
-    byte forms), AddBytes, AddString (u30-prefixed). Matching Get*
-    readers return `nil, "eof"` on short reads. package / available /
-    len / pos / reset introspection; `stream.new(str)` pre-fills for
-    decoding. 10/10 contract tests.
+    write buffer + read cursor + saved mark. Full v1 wire compatibility:
+    AddU/S 8/16/24/32, AddU30 LEB128 (7-bit septets, 1..5 bytes; 128 →
+    `0x80 0x01`), AddD64 IEEE-754 little-endian, AddBytes, AddString
+    (u30-prefixed). Matching Get* readers plus TestBytes (peek without
+    advancing pos), GetBytes(nil) / GetBytes() = "all remaining", and
+    GetString short-read returns `(nil, expected_length)` v1-style.
+    Introspection: package / available / len / pos / mark / reset (rewind
+    to last mark) / empty / prepare_add / prepare_get. readline() extracts
+    \r / \n / \r\n terminated lines in C. `stream.new(str)` pre-fills for
+    decoding; `__tostring` = `"<fan.stream available=N>"`. v1 aliases
+    GetABC{U,S}32 / AddABC{U,S}32 map to U30. 26/26 contract tests.
   - arm1/ARM64: normal + --asan builds both pass; LSan-clean.
   - M5.4 fan.sqlite3 (C) + fan.orm base — `src/db/sqlite3.c` binds
     libsqlite3 (userdata for `sqlite3*` + `sqlite3_stmt*`). Methods:

@@ -1,14 +1,19 @@
 /*
- * codec/stream.h — LuaFan v2 stream codec (u/i 8/16/24/30/32 + string/bytes).
- * Fully compiled-in; exposed as fan.stream with fan.stream.new().
+ * codec/stream.h — LuaFan v2 stream codec (u/i 8/16/24/32, u30, D64,
+ * string/bytes) with v1 wire compatibility.
  *
- * U30 is a variable-length unsigned integer:
- *   1 byte  header 00xxxxxx      -> 6-bit  value  (0 .. 0x3F)
- *   2 bytes header 01xxxxxx + b1 -> 14-bit value  (0 .. 0x3FFF)
- *   3 bytes header 10xxxxxx + b1 + b2 -> 22-bit value  (0 .. 0x3FFFFF)
- *   5 bytes header 11xxxxxx + 4 big-endian bytes -> 32-bit value
- * The header's low 6 bits carry the high 6 bits of the value in forms 1..3
- * and are ignored in the 5-byte form (matches LuaFan v1's wire format).
+ * U30 is a LEB128-style variable-length unsigned integer, byte-for-byte
+ * compatible with LuaFan v1:
+ *   each byte carries 7 payload bits in bits 0..6, and bit 7 (continuation)
+ *   set means "another byte follows". Values are read in little-endian
+ *   septet order. Range: 0 .. 0xFFFFFFFF (up to 5 bytes). Encoding widths:
+ *     0        .. 0x7F         -> 1 byte
+ *     0x80     .. 0x3FFF       -> 2 bytes
+ *     0x4000   .. 0x1FFFFF     -> 3 bytes
+ *     0x200000 .. 0xFFFFFFF    -> 4 bytes
+ *     0x10000000 .. 0xFFFFFFFF -> 5 bytes
+ *
+ * D64 is IEEE-754 binary64, 8 bytes little-endian (matches v1 stream_ffi).
  */
 #ifndef FAN2_CODEC_STREAM_H
 #define FAN2_CODEC_STREAM_H
