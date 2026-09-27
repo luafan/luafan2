@@ -17,4 +17,7 @@
 
 void fan_fifo_register(lua_State *L);
 
+/* Clears callback state before the owning Lua state is closed. */
+void fan_fifo_clear_lua_state(void);
+
 #endif /* FAN2_NET_FIFO_H */

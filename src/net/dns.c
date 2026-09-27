@@ -179,3 +179,10 @@ void fan_dns_register(lua_State *L) {
 #endif
     lua_setfield(L, -2, "dns");
 }
+
+void fan_dns_clear_lua_state(void) {
+    /* Companion to fan_dns_register — see runtime/coro.h teardown contract.
+     * Prevents evdns resolve callbacks from touching a dangling main state
+     * after lua_close. */
+    g_dns_L = NULL;
+}

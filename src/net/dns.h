@@ -12,4 +12,7 @@
 
 void fan_dns_register(lua_State *L);
 
+/* Clears callback state before the owning Lua state is closed. */
+void fan_dns_clear_lua_state(void);
+
 #endif /* FAN2_NET_DNS_H */

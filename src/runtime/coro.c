@@ -47,8 +47,23 @@ int fan_coro_park(lua_State *L) {
 }
 
 void fan_coro_wake(lua_State *main_L, lua_State *co, int ref, int nargs) {
+    if (!main_L) {
+        /* Owning lua_State was torn down (see fan_*_clear_lua_state before
+         * lua_close). Any pending resume here would UAF `co` (freed as part
+         * of the state's coroutine sweep) and the registry itself. Drop the
+         * wake; `ref` is orphaned but the registry no longer exists to leak
+         * into. See coro.h for the full teardown-window contract. */
+        (void)co; (void)ref; (void)nargs;
+        return;
+    }
     fan_coro_resume(co, nargs);
     if (ref != LUA_NOREF) {
+        luaL_unref(main_L, LUA_REGISTRYINDEX, ref);
+    }
+}
+
+void fan_unref_safe(lua_State *main_L, int ref) {
+    if (main_L && ref != LUA_NOREF) {
         luaL_unref(main_L, LUA_REGISTRYINDEX, ref);
     }
 }

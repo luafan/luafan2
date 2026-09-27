@@ -124,4 +124,7 @@ void *fan_ws_conn_push(lua_State *L, void *evcon, void *bev, void *ev_req,
  * predictable when we add it. */
 void fan_ws_register(lua_State *L);
 
+/* Clears callback state before the owning Lua state is closed. */
+void fan_ws_clear_lua_state(void);
+
 #endif

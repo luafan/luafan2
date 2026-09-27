@@ -1247,3 +1247,10 @@ void *fan_ws_conn_push(lua_State *L, void *evcon, void *bev, void *ev_req,
     }
     return w;
 }
+
+void fan_ws_clear_lua_state(void) {
+    /* Companion to fan_ws_register — see runtime/coro.h teardown contract.
+     * Prevents websocket read / close callbacks from resuming coroutines on
+     * a dangling main state after lua_close. */
+    g_ws_main_L = NULL;
+}

@@ -809,3 +809,10 @@ void fan_popen_register(lua_State *L) {
 #endif
     lua_setfield(L, -2, "popen");
 }
+
+void fan_popen_clear_lua_state(void) {
+    /* Companion to fan_popen_register — see runtime/coro.h teardown contract.
+     * Prevents subprocess stdout / stderr callbacks from waking coroutines
+     * on a torn-down lua_State. */
+    g_popen_L = NULL;
+}

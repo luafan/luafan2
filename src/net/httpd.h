@@ -30,4 +30,7 @@
  * this and picks between C / pure-Lua backends per bind call. */
 void fan_httpd_register(lua_State *L);
 
+/* Clears callback state before the owning Lua state is closed. */
+void fan_httpd_clear_lua_state(void);
+
 #endif /* FAN_NET_HTTPD_H */

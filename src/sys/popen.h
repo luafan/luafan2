@@ -33,4 +33,7 @@
  * of L's stack. */
 void fan_popen_register(lua_State *L);
 
+/* Clears callback state before the owning Lua state is closed. */
+void fan_popen_clear_lua_state(void);
+
 #endif /* FAN2_SYS_POPEN_H */

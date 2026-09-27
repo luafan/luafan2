@@ -385,3 +385,27 @@ int luaopen_fan(lua_State *L) {
     fan_popen_register(L);  /* adds fan.popen (M12) */
     return 1;
 }
+
+/* fan_clear_lua_states — aggregate teardown hook. Call this immediately
+ * before `lua_close(L)` when embedding luafan2 so every module that caches
+ * a main-thread pointer (tcp/httpd/http/udp/dns/fifo/websocket/popen) NULLs
+ * it out. Paired with the `if (!main_L) return;` guard in
+ * fan_coro_wake (runtime/coro.c) and the `if (!L)` early-returns in
+ * server_accept_cb / httpd gencb / evdns callbacks, this closes the
+ * lua_close → fan_loop_cleanup window against use-after-free from stray
+ * libevent callbacks. Safe to call multiple times and safe before any
+ * register() has run (each per-module clear is a plain assignment to
+ * NULL, no allocation freed). */
+void fan_clear_lua_states(void) {
+    fan_tcp_clear_lua_state();
+    fan_fifo_clear_lua_state();
+    fan_udp_clear_lua_state();
+    fan_dns_clear_lua_state();
+    fan_httpd_clear_lua_state();
+    fan_ws_clear_lua_state();
+    fan_http_clear_lua_state();
+    fan_popen_clear_lua_state();
+    /* Modules without cached main state (evdns, tls, zlib, stream,
+     * objectbuf, json, sqlite3, mariadb, posix) intentionally omitted —
+     * they never resume coroutines from libevent callbacks. */
+}

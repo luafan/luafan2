@@ -18,4 +18,7 @@
  * single `available=false` flag so lua/fan/http.lua can detect it. */
 void fan_http_register(lua_State *L);
 
+/* Clears callback state before the owning Lua state is closed. */
+void fan_http_clear_lua_state(void);
+
 #endif

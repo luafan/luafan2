@@ -157,7 +157,7 @@ static void conn_eventcb(struct bufferevent *bev, short what, void *arg) {
             int self_ref = c->self_ref;
             c->self_ref = LUA_NOREF;
             conn_wake(c, 1);
-            if (self_ref != LUA_NOREF) luaL_unref(g_main_L, LUA_REGISTRYINDEX, self_ref);
+            if (self_ref != LUA_NOREF) fan_unref_safe(g_main_L, self_ref);
         }
         return;
     }
@@ -174,7 +174,7 @@ static void conn_eventcb(struct bufferevent *bev, short what, void *arg) {
                 lua_pushnil(c->co);
                 lua_pushstring(c->co, c->err ? c->err : "connect failed");
                 conn_wake(c, 2);
-                if (self_ref != LUA_NOREF) luaL_unref(g_main_L, LUA_REGISTRYINDEX, self_ref);
+                if (self_ref != LUA_NOREF) fan_unref_safe(g_main_L, self_ref);
             } else {
                 conn_try_complete_receive(c);
             }
@@ -312,7 +312,7 @@ static void conn_drain_writecb(struct bufferevent *bev, void *arg) {
         c->drain_self_ref = LUA_NOREF;
         c->draining = 0;
         conn_release_bev(c);
-        if (ref != LUA_NOREF) luaL_unref(g_main_L, LUA_REGISTRYINDEX, ref);
+        if (ref != LUA_NOREF) fan_unref_safe(g_main_L, ref);
     }
 }
 

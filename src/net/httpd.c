@@ -1763,3 +1763,12 @@ void fan_httpd_register(lua_State *L) {
 #endif
     lua_setfield(L, -2, "httpd_c");
 }
+
+void fan_httpd_clear_lua_state(void) {
+    /* Companion to fan_httpd_register — clear the cached main-thread pointer
+     * before lua_close so late evhttp gencb / bufferevent callbacks (which
+     * read g_main_L to spawn per-request coroutines) see NULL and take the
+     * `if (!L)` early-return branch instead of dereferencing a dangling
+     * lua_State. See runtime/coro.h for the runtime-wide teardown contract. */
+    g_main_L = NULL;
+}

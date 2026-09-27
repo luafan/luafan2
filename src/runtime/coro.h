@@ -30,8 +30,26 @@ int fan_coro_park(lua_State *L);
 
 /* Wake helper: resume coroutine `co` with `nargs` values already on its stack,
  * then release the registry pin `ref` (the R17/R20 order: unref AFTER resume).
- * `main_L` owns the registry. */
+ * `main_L` owns the registry.
+ *
+ * NULL-safety: `main_L == NULL` means the owning Lua state has been torn down
+ * (fan_*_clear_lua_state() ran before lua_close). In that window a stray
+ * libevent event that fires between lua_close and fan_loop_cleanup would
+ * otherwise use-after-free either `co` or the registry. We drop the wake
+ * silently and leak the ref: the state is gone, the ref no longer refers to
+ * anything, and the process is on its way out. This is the runtime-wide
+ * counterpart of the tcp `!L` early-return in server_accept_cb — putting the
+ * check here covers all 8 modules that cache g_*_L (tcp/httpd/http/udp/dns/
+ * fifo/websocket/popen) in one edit. */
 void fan_coro_wake(lua_State *main_L, lua_State *co, int ref, int nargs);
+
+/* Registry helper: `luaL_unref(main_L, LUA_REGISTRYINDEX, ref)` but a no-op
+ * when main_L is NULL. Callbacks that drop pinned refs directly (e.g. tcp
+ * conn_drain_writecb releasing the drain self-ref, tcp conn_eventcb dropping
+ * the connect self-ref) go through this so the lua_close teardown window is
+ * safe. `ref == LUA_NOREF` is also a no-op, matching luaL_unref's own
+ * tolerance. */
+void fan_unref_safe(lua_State *main_L, int ref);
 
 /* The main thread of `L`'s global state — i.e. the thread that lives exactly as
  * long as the lua_State (and therefore owns the registry until lua_close).

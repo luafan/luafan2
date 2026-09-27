@@ -770,6 +770,14 @@ void fan_http_register(lua_State *L) {
     lua_setfield(L, -2, "http_c");
 }
 
+void fan_http_clear_lua_state(void) {
+    /* Companion to fan_http_register — clear the cached main-thread pointer
+     * before lua_close so late libcurl multi socket callbacks that resume
+     * parked coroutines via fan_coro_wake see NULL and drop the wake. See
+     * runtime/coro.h for the runtime-wide teardown contract. */
+    g_main_L = NULL;
+}
+
 #else   /* !FAN_WITH_CURL */
 
 void fan_http_register(lua_State *L) {
@@ -779,6 +787,12 @@ void fan_http_register(lua_State *L) {
     lua_pushboolean(L, 0);
     lua_setfield(L, -2, "available");
     lua_setfield(L, -2, "http_c");
+}
+
+void fan_http_clear_lua_state(void) {
+    /* No-op stub: the FAN_WITH_CURL=0 build has no cached state to clear.
+     * Provided so the aggregate teardown in luafan.c compiles the same
+     * regardless of the curl feature switch. */
 }
 
 #endif  /* FAN_WITH_CURL */

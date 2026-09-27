@@ -29,6 +29,13 @@
 /* Provided by luafan.c — opens the built-in `fan` library table. */
 int luaopen_fan(lua_State *L);
 
+/* Provided by luafan.c — clears every module's cached main-thread pointer.
+ * MUST be called before lua_close(L) whenever fan_loop_run() may have armed
+ * libevent events, so any late callback that fires between lua_close and
+ * fan_loop_cleanup sees NULL and drops the wake instead of dereferencing a
+ * dangling lua_State. See luafan.c for the full rationale. */
+void fan_clear_lua_states(void);
+
 static void print_usage(const char *argv0) {
     fprintf(stderr,
         "LuaFan v2 (%s)\n"
@@ -154,7 +161,8 @@ int main(int argc, char **argv) {
         print_usage(argv[0]);
     }
 
-    lua_close(L);        /* run finalizers first */
-    fan_loop_cleanup();  /* then free the event base */
+    fan_clear_lua_states();  /* NULL cached main-thread pointers */
+    lua_close(L);            /* run finalizers */
+    fan_loop_cleanup();      /* then free the event base */
     return status == LUA_OK ? 0 : 1;
 }

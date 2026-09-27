@@ -221,3 +221,10 @@ void fan_fifo_register(lua_State *L) {
 #endif
     lua_setfield(L, -2, "fifo");
 }
+
+void fan_fifo_clear_lua_state(void) {
+    /* Companion to fan_fifo_register — see runtime/coro.h teardown contract.
+     * Prevents libevent io callbacks on the FIFO from firing wakes into a
+     * dead lua_State. */
+    g_fifo_L = NULL;
+}

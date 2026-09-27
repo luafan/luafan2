@@ -352,3 +352,10 @@ void fan_udp_register(lua_State *L) {
 #endif
     lua_setfield(L, -2, "udp");
 }
+
+void fan_udp_clear_lua_state(void) {
+    /* Companion to fan_udp_register — see runtime/coro.h teardown contract.
+     * Prevents libevent recv callbacks from resuming a coroutine on a freed
+     * lua_State after lua_close. */
+    g_udp_L = NULL;
+}

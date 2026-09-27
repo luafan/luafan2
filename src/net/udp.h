@@ -23,4 +23,7 @@
 
 void fan_udp_register(lua_State *L);
 
+/* Clears callback state before the owning Lua state is closed. */
+void fan_udp_clear_lua_state(void);
+
 #endif /* FAN2_NET_UDP_H */
