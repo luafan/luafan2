@@ -78,7 +78,7 @@ Prebuilt release images are published to Docker Hub as multi-arch
 
 | Image                          | Base            | libc  | Size (typ.) |
 |--------------------------------|-----------------|-------|-------------|
-| `luafan/luafan2-ubuntu`        | `ubuntu:22.04`  | glibc | ~60 MB      |
+| `luafan/luafan2-ubuntu`        | `ubuntu:22.04`  | glibc | ~79 MB      |
 | `luafan/luafan2-alpine`        | `alpine:3.20.10`| musl  | ~18 MB      |
 
 Tags:

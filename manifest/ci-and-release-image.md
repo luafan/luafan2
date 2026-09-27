@@ -9,7 +9,7 @@ Docker Hub once main is green.
 | File                          | Image tag                       | Purpose               | Size (typ.) |
 |-------------------------------|---------------------------------|-----------------------|-------------|
 | `tests/Dockerfile`            | `luafan2-ci:local`              | CI + local test image | ~450 MB     |
-| `Dockerfile.release.ubuntu`   | `luafan/luafan2-ubuntu:<tag>`   | Runtime, glibc        | ~60 MB      |
+| `Dockerfile.release.ubuntu`   | `luafan/luafan2-ubuntu:<tag>`   | Runtime, glibc        | ~79 MB      |
 | `Dockerfile.release.alpine`   | `luafan/luafan2-alpine:<tag>`   | Runtime, musl         | ~18 MB      |
 
 `tests/Dockerfile` is a **fat** image: build toolchain, `mariadb-server`,
