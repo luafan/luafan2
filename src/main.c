@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
 #define FAN2_VERSION "2.0.0-dev"
 
@@ -81,6 +82,21 @@ static void set_arg_table(lua_State *L, int argc, char **argv, int script_idx) {
 }
 
 int main(int argc, char **argv) {
+    /* Ignore SIGPIPE. A libevent bufferevent that writes to a socket whose
+     * peer has closed will otherwise take the default SIGPIPE action and
+     * terminate the process. Linux hides this in practice because our
+     * write paths go through `send(..., MSG_NOSIGNAL)` / libevent's own
+     * SIGPIPE guard; macOS has no MSG_NOSIGNAL and libevent does not set
+     * SO_NOSIGPIPE per socket, so `fan` on macOS was dying with rc=141
+     * during `test_tcp` (the "shutdown with pending output" scenario).
+     * Ignoring SIGPIPE globally is the standard daemon idiom and lets
+     * write() surface EPIPE to Lua instead of killing the process.
+     *
+     * Portable enough: POSIX signal() with SIG_IGN is defined on Linux,
+     * macOS, and every BSD; on Windows this whole file is not built
+     * (we do not ship a native Windows binary yet). */
+    signal(SIGPIPE, SIG_IGN);
+
     lua_State *L = luaL_newstate();
     if (!L) {
         fprintf(stderr, "fan: cannot create Lua state (out of memory)\n");
