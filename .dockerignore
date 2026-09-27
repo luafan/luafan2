@@ -15,10 +15,12 @@ build-asan/
 build-coverage/
 build-*/
 
-# CI test image and test tree — release image is built independently
-# from tests/Dockerfile (the "CI/test" image) and does NOT ship or
-# run the test suite.
-tests/
+# NOTE: DO NOT ignore tests/ here even though the release images do
+# not COPY from it — .dockerignore is per-context, and CI builds
+# tests/Dockerfile from the SAME context. That Dockerfile
+# `COPY tests/docker-entrypoint.sh ...`, so hiding tests/ breaks CI.
+# The release Dockerfiles simply don't COPY tests/, which costs a
+# few KB of context upload but nothing more.
 
 # Manifest, docs, and CI config — image content, not runtime code.
 manifest/
