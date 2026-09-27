@@ -15,6 +15,8 @@
 #include "platform.h"
 #include "runtime/loop.h"
 
+#include "luafan.h"
+
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -26,8 +28,6 @@
 
 #define FAN2_VERSION "2.0.0-dev"
 
-/* Provided by luafan.c — opens the built-in `fan` library table. */
-int luaopen_fan(lua_State *L);
 
 /* Provided by luafan.c — clears every module's cached main-thread pointer.
  * MUST be called before lua_close(L) whenever fan_loop_run() may have armed

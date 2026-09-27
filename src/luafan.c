@@ -12,6 +12,7 @@
  *   fan.sanitize_utf8(s)  -> string with invalid bytes replaced by U+FFFD (v1: EF BF BD).
  *                            Returns the input unchanged on the all-valid fast path.
  */
+#include "luafan.h"
 #include "platform.h"
 #include "runtime/loop.h"
 #include "runtime/coro.h"
