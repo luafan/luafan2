@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #include <event2/bufferevent.h>
 #include <event2/buffer.h>
@@ -568,7 +569,8 @@ static int l_bind(lua_State *L) {
         sv->on_accept_ref = LUA_NOREF;
         if (sv->tls_ctx) { fan_tls_server_ctx_free(sv->tls_ctx); sv->tls_ctx = NULL; }
         lua_pushnil(L);
-        lua_pushstring(L, "bind failed");
+        lua_pushfstring(L, "bind failed on %s:%d: errno=%d (%s)",
+                        host, port, errno, strerror(errno));
         return 2;
     }
     /* server userdata is the single return value */
