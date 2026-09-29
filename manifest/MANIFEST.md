@@ -28,6 +28,15 @@ not planning notes.
   methods; auto-diff persists only changed columns.
 
 ## Networking
+- [fan.udp / fan.udpd](udp.md) — M3 + M18 UDP.  M18 adds a
+  callback-based async API (`fan.udp.new_async{...}`) that restores
+  v1 `fan.udpd` semantics: immediate handle, `onread(self, data, dest)`
+  callback per datagram (`dest` is a `UDP_AddrInfo` userdata with
+  `getHost` / `getIP` / `getPort`), `onsendready` armed by
+  `sock:send_req()`, `sock:rebind()` for mobile network transitions,
+  and `make_dest` / `make_dests` for building destinations.
+  `require("fan.udpd")` gives `.new` / `.make_dest` / `.make_dests` as
+  v1 aliases.
 - [fan.tcp / fan.tcpd](tcp.md) — M2 + M17 TCP client + server.  M17
   adds a callback-based async API (`connect_async` / `bind_async`)
   that restores the full v1 `fan.tcpd` contract: immediate handle
