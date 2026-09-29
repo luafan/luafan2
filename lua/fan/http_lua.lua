@@ -292,10 +292,13 @@ local function do_once(opts)
 
   conn:close()
   return {
-    status = code,
-    reason = reason,
-    headers = headers,
-    body = resp_body,
+    status       = code,
+    -- M16.4: v1 fan.http named this field `responseCode`; keep as an alias
+    -- so legacy code reading resp.responseCode works on both backends.
+    responseCode = code,
+    reason       = reason,
+    headers      = headers,
+    body         = resp_body,
   }
 end
 

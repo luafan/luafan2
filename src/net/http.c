@@ -325,6 +325,11 @@ static void check_multi_info(void) {
             lua_newtable(co);                                    /* resp = {} */
             lua_pushinteger(co, code);
             lua_setfield(co, -2, "status");
+            /* M16.4: v1 fan.http named this field `responseCode`; keep it
+             * as a permanent alias so legacy Luan code that reads
+             * resp.responseCode keeps working without an adapter layer. */
+            lua_pushinteger(co, code);
+            lua_setfield(co, -2, "responseCode");
             /* reason: libcurl doesn't expose it directly; parse from the
              * saved status line "HTTP/1.1 200 OK\r\n". First line of
              * r->resp_headers before the first "\r\n". */

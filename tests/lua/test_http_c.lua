@@ -83,6 +83,9 @@ s:test("GET: status/reason/headers/body via C backend", function()
   T.eq(resp.headers["content-type"], "text/plain")
   T.eq(resp.headers["x-server"], "test-origin")
   T.eq(resp.body, "hello world")
+  -- M16.4: C backend also exposes v1-compatible `responseCode` alias
+  T.eq(resp.responseCode, 200)
+  T.eq(resp.responseCode, resp.status)
 end)
 
 s:test("GET: query table merged into URL", function()

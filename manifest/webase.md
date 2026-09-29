@@ -33,6 +33,32 @@ Enabled unconditionally in the luafan2 build (see manifest links):
 | `fan.zlib.gzip_compress(data)` | Content-Encoding: gzip framing    |
 | `req.remote_addr` / `req.remoteip` | httpd peer IP for auth checks |
 
+## webfile gzip fallback (M16.4)
+
+`webase/webfile.lua` serves static files with an on-disk-body → in-RAM
+gzip cache.  Prior to M16.4, `get_file_gzip_body` unconditionally
+dereferenced the compressor's return value with `#gbody`, which had
+three failure modes if `fan.zlib.gzip_compress` ever returned nil:
+
+* `#nil` raised, tearing down the request coroutine;
+* the response body ended up empty on the recovery path;
+* `Content-Encoding: gzip` was still announced, so a client that
+  survived would try to inflate an empty stream.
+
+M16.4 makes each stage of `get_file_gzip_body` fall back cleanly:
+
+* cache miss + body read failure → returns nil early;
+* compressor returns nil → returns nil (no cache write, no crash).
+
+The `web()` dispatcher then keeps the identity body and **omits** the
+`Content-Encoding` header entirely — a spec-compliant response.
+`Content-Length` is computed off the served body in both branches so
+framing stays consistent.
+
+Covered by `tests/lua/test_webase_webfile.lua`: happy path (gzip
+succeeds, header set), forced failure via monkey-patched
+`fan.zlib.gzip_compress`, and the "no Accept-Encoding" identity path.
+
 ## Not ported (deliberate)
 
 * `curl-impersonate` — not in scope for luafan2.

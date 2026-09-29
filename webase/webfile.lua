@@ -100,20 +100,29 @@ local function get_file_body(file_info)
     return body
 end
 
+-- Return the gzip-compressed body for a file, or nil if compression is
+-- unavailable / failed (caller should then serve the identity body
+-- without the Content-Encoding header).
+--
+-- M16.4: robustness fix — the previous version dereferenced the gzip
+-- result with `#gbody` unconditionally.  If gzip_compress returned nil
+-- (fan.zlib compiled out, or the input somehow tripped the compressor),
+-- we'd (a) crash on `#nil`, (b) serve an empty body, and (c) still
+-- announce `Content-Encoding: gzip`, so the client would try to inflate
+-- an empty stream.  The three failures now short-circuit into a plain
+-- fallback path.
 local function get_file_gzip_body(file_info)
     local path = file_info.path
-    local gbody = gzip_cache:get(path)
-    if not gbody then
-        local body = get_file_body(file_info)
-        -- v1: `zlib.compress(body, nil, nil, 31)` selects gzip framing
-        -- (windowBits = 15 + 16 in zlib). fan.zlib.gzip_compress emits
-        -- the same wire format.
-        gbody = zlib.gzip_compress(body)
-        gzip_cache:set(path, gbody, #(gbody))
+    local cached = gzip_cache:get(path)
+    if cached then return cached end
 
-        print("calc gzip body", path)
-    end
+    local body = get_file_body(file_info)
+    if not body then return nil end   -- source read failed
 
+    local gbody = zlib.gzip_compress(body)
+    if not gbody then return nil end  -- compressor unavailable / errored
+
+    gzip_cache:set(path, gbody, #gbody)
     return gbody
 end
 
@@ -252,8 +261,17 @@ local function web(req, resp)
 
                 local accept = req.headers["Accept-Encoding"]
                 if accept and type(accept) == "string" and string.find(accept, "gzip") then
-                    body = get_file_gzip_body(file_info)
-                    resp:addheader("Content-Encoding", "gzip")
+                    -- M16.4: only switch to the gzip body + advertise the
+                    -- encoding when compression actually succeeded.  If
+                    -- get_file_gzip_body returns nil we keep the identity
+                    -- body and omit the header — a valid, spec-compliant
+                    -- response.  Content-Length is set below off `body`,
+                    -- so the client sees consistent framing either way.
+                    local gbody = get_file_gzip_body(file_info)
+                    if gbody then
+                        body = gbody
+                        resp:addheader("Content-Encoding", "gzip")
+                    end
                 end
 
                 resp:addheader("Cache-Control", "max-age=86400")

@@ -146,7 +146,11 @@ end
 function M.request(opts)
   assert(type(opts) == "table" and opts.url, "http.request requires {url=...}")
   local follow = opts.follow_redirects
-  if follow == nil then follow = true end
+  -- Default is TRUE — matches modern HTTP clients (fetch / axios / requests).
+  -- Legacy v1 code that expects "return the first hop even if it's a 302"
+  -- can either set follow_redirects = false per-call, or flip the module
+  -- default once via M.set_default_follow_redirects(false).
+  if follow == nil then follow = M._follow_redirects_default end
   local max_redirects = opts.max_redirects or 5
 
   local backend = pick_backend(opts)
@@ -158,6 +162,12 @@ function M.request(opts)
     for k, v in pairs(opts) do o[k] = v end
     o.url = merge_query(opts.url, opts.query)
     o.query = nil                     -- already folded in
+    -- M16.4: propagate the module-level follow_redirects default down
+    -- into http_lua.request.  Without this override, http_lua sees
+    -- opts.follow_redirects == nil and re-defaults to true on its own,
+    -- ignoring the shim's set_default_follow_redirects knob.
+    o.follow_redirects = follow
+    o.max_redirects    = max_redirects
     -- Thread module-scoped defaults so downstream code that inspects
     -- them (or a future Lua backend that honours them) sees the same
     -- values as the C path.
@@ -202,11 +212,25 @@ end
 -- ---------------------------------------------------------------------------
 -- Convenience verbs. All route through M.request so the backend/redirect
 -- logic stays in one place.
+--
+-- M16.4: accept BOTH shapes:
+--   fan.http.get(url [, opts])       -- luafan2's original form
+--   fan.http.get{ url = ..., ... }   -- v1-era single-table form
+-- Detected by the type of the first arg — url is always a string, so a
+-- table first arg unambiguously means the caller inlined everything.
 -- ---------------------------------------------------------------------------
 local function verb(m)
-  return function(url, o)
-    o = o or {}
-    o.url = url
+  return function(a, b)
+    local o
+    if type(a) == "table" then
+      -- Single-table form: fan.http.get{ url=..., headers=..., ... }
+      o = a
+      -- b is ignored (typo protection: don't silently accept a stray 2nd arg)
+    else
+      -- (url, opts) form: fan.http.get("http://...", { headers=... })
+      o = b or {}
+      o.url = a
+    end
     o.method = m
     return M.request(o)
   end
@@ -251,6 +275,24 @@ end
 function M.cookiejar(path) M._cookiejar = tostring(path) end
 function M.cainfo(path)    M._cainfo    = tostring(path) end
 function M.capath(path)    M._capath    = tostring(path) end
+
+-- ---------------------------------------------------------------------------
+-- Module-level default for follow_redirects (M16.4).
+--
+-- The luafan2 default is true (modern HTTP client convention).  v1 users
+-- who rely on "return the first hop, don't unwrap 302 to 200" can flip
+-- this once at process startup:
+--
+--   require("fan.http").set_default_follow_redirects(false)
+--
+-- Per-call opts.follow_redirects still overrides.  This function does NOT
+-- retroactively change requests already in flight — it just alters what
+-- future requests use when they don't specify follow_redirects themselves.
+-- ---------------------------------------------------------------------------
+M._follow_redirects_default = true
+function M.set_default_follow_redirects(bool)
+  M._follow_redirects_default = not not bool
+end
 
 -- Expose backend selector for tests / introspection.
 M._pick_backend = pick_backend

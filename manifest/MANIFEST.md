@@ -27,6 +27,14 @@ not planning notes.
   are live objects with `:update()` / `:delete()` / `:remove()`
   methods; auto-diff persists only changed columns.
 
+## HTTP client
+- [fan.http](http.md) — M4 + M13.C + M16.4 HTTP/1.1 client shim over
+  either the libcurl C backend or the pure-Lua backend.  Shared
+  response shape (`status` + v1-compatible `responseCode` alias),
+  verb helpers that accept both `get(url, opts)` and single-table
+  `get{url=...}` forms, and a module-level
+  `set_default_follow_redirects(bool)` knob for v1 compatibility.
+
 ## Codecs
 - [fan.json](json.md) — M9 + M16.3 native JSON codec.  RFC 8259
   numbers/escapes/UTF-8, sentinel-based null, explicit array/object

@@ -436,4 +436,88 @@ s:test("patch / update verbs dispatch through M.request with the right method", 
   T.truthy(r2.body:find("M=UPDATE", 1, true))
 end)
 
+-- ---------------------------------------------------------------------------
+-- M16.4 additions: single-table verb form, responseCode alias,
+-- set_default_follow_redirects module knob.
+-- ---------------------------------------------------------------------------
+
+s:test("M16.4: fan.http.get accepts a single-table form (url inside opts)", function()
+  -- Legacy v1 code style: everything as a single table.  luafan2 pre-M16.4
+  -- only accepted (url, opts); this test guards the compatibility.
+  local PORT = 24430
+  local server, r_pos, r_tbl
+  run(function()
+    server = start_origin(PORT)
+    r_pos = assert(http.get(BASE .. PORT .. "/echo"))          -- (url) form
+    server:close()
+    server = start_origin(PORT)
+    r_tbl = assert(http.get{ url = BASE .. PORT .. "/echo" })  -- {url=...} form
+    server:close()
+  end)
+  T.eq(r_pos.status, 200); T.eq(r_tbl.status, 200)
+  T.truthy(r_pos.body:find("M=GET", 1, true))
+  T.truthy(r_tbl.body:find("M=GET", 1, true))
+end)
+
+s:test("M16.4: single-table verb form threads headers and body", function()
+  -- The shared echo dispatch reflects the "X-Foo" request header (lowercased
+  -- to "x-foo" server-side) and the request body into the response body
+  -- shaped as "M=... Q=... H=<x-foo> BODY=...".
+  local PORT = 24431
+  local server, resp
+  run(function()
+    server = start_origin(PORT)
+    resp = assert(http.post{
+      url     = BASE .. PORT .. "/echo",
+      headers = { ["X-Foo"] = "single-table-marker" },
+      body    = "hello=world",
+    })
+    server:close()
+  end)
+  T.eq(resp.status, 200)
+  T.truthy(resp.body:find("M=POST", 1, true))
+  T.truthy(resp.body:find("H=single-table-marker", 1, true))
+  T.truthy(resp.body:find("BODY=hello=world", 1, true))
+end)
+
+s:test("M16.4: resp.responseCode is a numeric alias for resp.status", function()
+  local PORT = 24432
+  local server, resp
+  run(function()
+    server = start_origin(PORT)
+    resp = assert(http.get(BASE .. PORT .. "/echo"))
+    server:close()
+  end)
+  T.eq(resp.status, 200)
+  T.eq(resp.responseCode, 200)
+  T.eq(resp.status, resp.responseCode)
+end)
+
+s:test("M16.4: set_default_follow_redirects(false) makes 302 stop at hop 1", function()
+  -- The shim's redirect loop is skipped when follow_redirects is false.
+  -- Baseline (with default true) is already covered by the earlier "302
+  -- redirect is followed to final resource" test; here we verify the
+  -- module-level knob flips behaviour without needing every caller to
+  -- pass follow_redirects = false explicitly.
+  local PORT = 24433
+  local resp
+  http.set_default_follow_redirects(false)
+  run(function()
+    -- Reuse the shared /redir path which returns 302 -> /hello.
+    local persistent = assert(fan.tcp.bind("127.0.0.1", PORT, function(conn)
+      local req = read_request(conn)
+      conn:send(dispatch(req))
+      fan.sleep(0.02)
+      conn:close()
+    end))
+    resp = http.get(BASE .. PORT .. "/redir")
+    persistent:close()
+  end)
+  http.set_default_follow_redirects(true)   -- restore for subsequent tests
+  T.not_nil(resp)
+  T.eq(resp.status, 302)
+  T.eq(resp.responseCode, 302)
+  T.truthy(resp.headers["location"])   -- Location header preserved
+end)
+
 os.exit(T.run(s))
