@@ -1,0 +1,9 @@
+/* fixture stylesheet — matches the JS fixture: exercised for
+   Content-Type / gzip / ETag paths in webase integration tests. */
+body {
+  font-family: -apple-system, "Segoe UI", sans-serif;
+  color: #222;
+}
+h1 {
+  color: #06c;
+}

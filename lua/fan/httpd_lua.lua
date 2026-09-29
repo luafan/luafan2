@@ -459,6 +459,16 @@ local function serve_one(handler, conn)
     pcall(resp.reply, resp, 400, { ["Content-Type"] = "text/plain" }, msg)
     return
   end
+  -- v1 parity: expose the peer address on the request. v1 called this
+  -- `req.remoteip`; we surface the same name plus `remote_addr`, which
+  -- webase and other v1-era apps also read. getpeername may fail on a
+  -- half-closed socket — in that case we leave both fields nil so
+  -- authorisation checks fall through to header-based fallbacks.
+  local peer_ok, peer_ip = pcall(function() return conn:getpeername() end)
+  if peer_ok and peer_ip then
+    req.remoteip    = peer_ip
+    req.remote_addr = peer_ip
+  end
   -- Stash the response on the request so v1 :websocket_accept() (which
   -- takes no arguments) can find it. Kept as an internal field.
   req._resp = resp

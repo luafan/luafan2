@@ -1,0 +1,29 @@
+-- webase/ctxpool.lua — MariaDB connection-pool + ORM aggregator (NOT ported).
+--
+-- webase v1 defined its own tiny `ctxpool` that scanned `database/*.lua`,
+-- pulled the ORM table definitions each file returned, and wrapped
+-- `mariadb.pool.new(list)` around them. It relied on v1's specific
+-- `mariadb.pool.new(orm_tables)` signature, which took the ORM schema
+-- table as its only argument.
+--
+-- luafan2 has a different (and much simpler) shape:
+--   fan.mariadb.pool.new{ host=..., user=..., password=..., database=...,
+--                         charset=..., max_size=..., idle_ping=... }
+--   -> Pool object with :with(fn) / :acquire() / :release(db) / :stats()
+--
+-- fan.orm is separate; it consumes a `db` handle acquired from the pool,
+-- so there's no equivalent "orm table + connection pool" fused constructor
+-- to write here.
+--
+-- Because the shapes differ this much, we deliberately do NOT ship a
+-- shim: any callable pretending to be v1's ctxpool would either quietly
+-- drop the ORM schema on the floor or force us to reimplement v1's ORM
+-- surface, both of which are worse than an explicit re-port. Apps that
+-- need a DB pool should call fan.mariadb.pool.new{...} directly from
+-- their service or handle modules; ORM users additionally
+-- `require "fan.orm"` and build a wrapper around `pool:with(fn)`.
+--
+-- Loading this module returns an error so mis-ports fail loudly instead
+-- of hiding a schema-missing surface behind a table lookup.
+error("webase.ctxpool is not ported to luafan2. Use fan.mariadb.pool.new{...} " ..
+      "and fan.orm directly. See webase/README.md for the migration note.", 0)
