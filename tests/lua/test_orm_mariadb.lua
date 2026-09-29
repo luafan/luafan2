@@ -54,9 +54,10 @@ s:test("define + insert + find_by + list on mariadb", function()
     name  = "VARCHAR(64) NOT NULL",
     email = "VARCHAR(128)",
   })
-  local id1 = User.insert{name = "alice", email = "a@x"}
-  local id2 = User.insert{name = "bob"}
-  T.eq(id1, 1); T.eq(id2, 2)
+  -- M16.2: insert returns a live row object; use .id to get the pk value
+  local u1 = User.insert{name = "alice", email = "a@x"}
+  local u2 = User.insert{name = "bob"}
+  T.eq(u1.id, 1); T.eq(u2.id, 2)
 
   local u = User.find_by{name = "alice"}
   T.eq(u.email, "a@x"); T.eq(u.id, 1)

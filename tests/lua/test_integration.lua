@@ -90,9 +90,10 @@ s:test("integ-1: REST /users CRUD end-to-end (httpd_c + orm + sqlite3 + json + h
           if not ok or type(obj) ~= "table" or type(obj.name) ~= "string" then
             resp:reply(400, {}, "bad json"); return
           end
-          local uid = User.insert{ name = obj.name, email = obj.email }
+          -- M16.2: insert returns a row object; unwrap .id for the JSON reply
+          local u = User.insert{ name = obj.name, email = obj.email }
           resp:reply(201, { ["Content-Type"] = "application/json" },
-            json.encode{ id = uid })
+            json.encode{ id = u.id })
         elseif req.method == "GET" and id then
           local u = User.find_by{ id = id }
           if not u then resp:reply(404, {}, "not found"); return end

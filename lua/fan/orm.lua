@@ -121,10 +121,165 @@ local function build_where(driver, where)
   return " WHERE " .. table.concat(parts, " AND "), args
 end
 
+----------------------------------------------------------------------
+-- Active-row support (M16.2)
+--
+-- Rows returned by Model.insert / find_by / list are "live" objects: they
+-- carry a metatable with :update() / :delete() / :remove() methods that
+-- talk back to the database.
+--
+--   local u = User.find_by{ name = "alice" }
+--   u.email = "new@x"
+--   u:update()             -- auto-diff: only UPDATEs the columns that changed
+--   u:update{ age = 30 }   -- explicit override: UPDATEs the given columns
+--   u:delete()             -- DELETE WHERE pk = self[pk_field]
+--   u:remove()             -- alias of :delete()
+--
+-- Baseline storage:
+--   Each row's "originally-loaded values" snapshot lives in a weak-key map
+--   attached to the row's metatable (row_mt.__attr_map[row] = attr_table).
+--   Using a weak-key table lets attr be GC'd automatically when the row is
+--   collected — we don't need explicit cleanup.  Using a table stored in
+--   the metatable (rather than a hidden field inside the row itself) keeps
+--   the row's own key namespace clean: `for k, v in pairs(row) do end`
+--   sees exactly the SQL columns, nothing else.
+--
+-- Escape hatch:
+--   Model.list{ raw = true }  returns plain maps (no metatable) for the
+--   times you want cheap read-only bulk access.  Model.raw_query is also
+--   always plain (semantics unknown, no pk to reason about).
+----------------------------------------------------------------------
+
+-- Build the row metatable for one specific Model.  Closes over driver,
+-- table_name, pk_field, and schema so :update() / :delete() know what
+-- SQL to emit.  Called once per ctx:define(); attach_row reuses it for
+-- every row that model returns.
+local function make_row_mt(driver, table_name, pk_field, schema)
+  local qn  = driver:quote_ident(table_name)
+  local qpk = driver:quote_ident(pk_field)
+
+  local row_mt = {}
+  -- Weak-key map: attr_map[row] = { column = original_value, ... }
+  row_mt.__attr_map = setmetatable({}, { __mode = "k" })
+
+  local function do_update_diff(self, attr)
+    -- Emit UPDATE for columns whose current row value differs from the
+    -- snapshot.  If nothing changed, return 0 (rows_affected style).
+    local sets, args, i = {}, {}, 0
+    for k, _ in pairs(schema) do
+      if k ~= "pk" and self[k] ~= attr[k] then
+        i = i + 1
+        sets[#sets + 1] = driver:quote_ident(k) .. " = " .. driver:placeholder(i)
+        args[#args + 1] = self[k]
+      end
+    end
+    if i == 0 then return 0 end
+    i = i + 1
+    -- Use the snapshot's pk (not self's) so a diff that RENAMES the pk
+    -- column still WHEREs against the on-disk row's identity.
+    args[#args + 1] = attr[pk_field] ~= nil and attr[pk_field] or self[pk_field]
+    local sql = "UPDATE " .. qn .. " SET " .. table.concat(sets, ",")
+             .. " WHERE " .. qpk .. " = " .. driver:placeholder(i)
+    local n, err = driver:exec_with_args(sql, args)
+    if not n then return nil, err end
+    -- Refresh the snapshot from the row's current state.  This makes
+    -- successive u:update() calls diff against the last-flushed state,
+    -- not the original SELECT.
+    for k, _ in pairs(schema) do
+      if k ~= "pk" then attr[k] = self[k] end
+    end
+    return n
+  end
+
+  local function do_update_override(self, attr, override)
+    -- Explicit-columns mode: caller specified exactly which columns to
+    -- UPDATE (and their new values).  Apply them to self AND the snapshot.
+    -- Snapshot the pk BEFORE mutating self, so if the caller included the
+    -- pk column in `override` (renaming a row), WHERE still targets the
+    -- old row.
+    local old_pk = self[pk_field]
+    local sets, args, i = {}, {}, 0
+    for k, v in pairs(override) do
+      i = i + 1
+      sets[#sets + 1] = driver:quote_ident(k) .. " = " .. driver:placeholder(i)
+      args[#args + 1] = v
+      self[k] = v
+      if attr then attr[k] = v end
+    end
+    if i == 0 then return 0 end
+    i = i + 1
+    args[#args + 1] = old_pk
+    local sql = "UPDATE " .. qn .. " SET " .. table.concat(sets, ",")
+             .. " WHERE " .. qpk .. " = " .. driver:placeholder(i)
+    return driver:exec_with_args(sql, args)
+  end
+
+  row_mt.__index = {
+    update = function(self, override)
+      local attr = row_mt.__attr_map[self]
+      if override then
+        return do_update_override(self, attr, override)
+      end
+      if not attr then
+        -- Row was constructed without a baseline (e.g. detached copy).
+        -- Fall back to "UPDATE every schema-known column with self's
+        -- current value" so the call is not silently a no-op.  Rare —
+        -- attach_row always installs a baseline.
+        local synthetic = {}
+        for k, _ in pairs(schema) do
+          if k ~= "pk" and k ~= pk_field then synthetic[k] = self[k] end
+        end
+        return do_update_override(self, nil, synthetic)
+      end
+      return do_update_diff(self, attr)
+    end,
+
+    delete = function(self)
+      local sql = "DELETE FROM " .. qn .. " WHERE " .. qpk
+               .. " = " .. driver:placeholder(1)
+      local n, err = driver:exec_with_args(sql, { self[pk_field] })
+      if not n then return nil, err end
+      -- Detach: further :update() / :delete() calls become plain-table
+      -- errors ("attempt to call a nil value") rather than silently
+      -- issuing SQL against a row that no longer exists.
+      row_mt.__attr_map[self] = nil
+      setmetatable(self, nil)
+      return n
+    end,
+  }
+  -- :remove is a v1-era alias for :delete
+  row_mt.__index.remove = row_mt.__index.delete
+
+  return row_mt
+end
+
+-- Attach the given row_mt to a row and record its baseline snapshot.
+-- `pk_field` is passed explicitly so we can guarantee attr[pk_field] is
+-- captured even in the rare case where the schema table's `pk` entry
+-- points to a column name that has no corresponding schema entry (i.e.
+-- the pk column type was not declared, only referenced via schema.pk).
+local function attach_row(row, row_mt, schema, pk_field)
+  local attr = {}
+  for k, _ in pairs(schema) do
+    if k ~= "pk" then attr[k] = row[k] end
+  end
+  -- Belt-and-suspenders: attr must contain the pk value for :update()'s
+  -- WHERE clause to work if the caller ever renames the pk column.
+  attr[pk_field] = row[pk_field]
+  row_mt.__attr_map[row] = attr
+  setmetatable(row, row_mt)
+  return row
+end
+
 local function make_model(ctx, name, schema)
   local m = { _ctx = ctx, _name = name, _schema = schema }
   local driver = ctx.driver
   local qn = driver:quote_ident(name)
+  local pk = schema.pk or "id"
+
+  -- One row_mt per model (methods close over driver / table_name / pk / schema).
+  local row_mt = make_row_mt(driver, name, pk, schema)
+  m._row_mt = row_mt   -- exposed for tests / advanced users; treat as private
 
   function m.insert(fields)
     local cols, ph, args = {}, {}, {}
@@ -142,7 +297,20 @@ local function make_model(ctx, name, schema)
              .. ") VALUES (" .. table.concat(ph, ",") .. ")"
     local ok, err = driver:exec_with_args(sql, args)
     if not ok then return nil, err end
-    return driver:last_insert_rowid()
+
+    -- M16.2: return the inserted row as an active-record object.  The row's
+    -- column values come from the caller's `fields` plus the autoincrement
+    -- pk pulled from the driver.  This is the v1-era shape: callers write
+    --   local u = User.insert{ name = "alice" }
+    --   u.email = "a@x"; u:update()
+    -- Legacy callers who just want the id can still use  local u =
+    -- User.insert{...}; local id = u.id  which is a one-token change.
+    local row = {}
+    for k, v in pairs(fields) do row[k] = v end
+    if row[pk] == nil then
+      row[pk] = driver:last_insert_rowid()
+    end
+    return attach_row(row, row_mt, schema, pk)
   end
 
   function m.find_by(where)
@@ -150,6 +318,7 @@ local function make_model(ctx, name, schema)
     local sql = "SELECT * FROM " .. qn .. w .. " LIMIT 1"
     local rows, err = driver:query(sql, table.unpack(args))
     if not rows then return nil, err end
+    if rows[1] then attach_row(rows[1], row_mt, schema, pk) end
     return rows[1]
   end
 
@@ -159,7 +328,12 @@ local function make_model(ctx, name, schema)
     local order = opts.order and (" ORDER BY " .. opts.order) or ""
     local limit = opts.limit and (" LIMIT " .. tonumber(opts.limit)) or ""
     local sql = "SELECT * FROM " .. qn .. w .. order .. limit
-    return driver:query(sql, table.unpack(args))
+    local rows, err = driver:query(sql, table.unpack(args))
+    if not rows then return nil, err end
+    if not opts.raw then
+      for _, row in ipairs(rows) do attach_row(row, row_mt, schema, pk) end
+    end
+    return rows
   end
 
   function m.update(id, fields)
@@ -174,14 +348,14 @@ local function make_model(ctx, name, schema)
     i = i + 1
     args[#args + 1] = id
     local sql = "UPDATE " .. qn .. " SET " .. table.concat(sets, ",")
-             .. " WHERE " .. driver:quote_ident(schema.pk or "id")
+             .. " WHERE " .. driver:quote_ident(pk)
              .. " = " .. driver:placeholder(i)
     return driver:exec_with_args(sql, args)
   end
 
   function m.delete(id)
     local sql = "DELETE FROM " .. qn .. " WHERE "
-              .. driver:quote_ident(schema.pk or "id")
+              .. driver:quote_ident(pk)
               .. " = " .. driver:placeholder(1)
     return driver:exec_with_args(sql, {id})
   end

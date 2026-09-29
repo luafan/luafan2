@@ -22,6 +22,10 @@ not planning notes.
   Zero LuaRocks dependencies; drop-in replacement for the `lsqlite3`
   binding (matching API names, numeric result codes, iterator shapes,
   named parameters, column metadata).
+- [fan.orm](orm.md) — M5 + M16.2 active-record ORM base with SQLite
+  and MariaDB driver adapters.  Rows returned by insert/find_by/list
+  are live objects with `:update()` / `:delete()` / `:remove()`
+  methods; auto-diff persists only changed columns.
 
 ## Test coverage
 - [Coverage — latest run](coverage-latest.md) — most recent
