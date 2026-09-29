@@ -1,5 +1,5 @@
 /*
- * luafan.c — LuaFan v2 top-level module entry (luaopen_fan2).
+ * luafan.c — LuaFan v2 top-level module entry (luaopen_fan).
  *
  * M0 scope: pure, event-loop-independent utilities so the build/test harness
  * can be validated end-to-end under ASan on arm1 before the runtime core lands.
