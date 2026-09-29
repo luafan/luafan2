@@ -16,6 +16,11 @@
  *   fan.zlib.deflate_raw(data [, level])  -> string or nil,err
  *       level: 0..9, default Z_DEFAULT_COMPRESSION (-1)
  *   fan.zlib.inflate_raw(data)            -> string or nil,err
+ *   fan.zlib.gzip_compress(data [, level]) -> gzip-framed string or nil,err
+ *       level: same range as deflate_raw. Produces a self-contained
+ *       gzip stream (10-byte header, CRC32 + ISIZE trailer) suitable
+ *       for HTTP `Content-Encoding: gzip` on-the-wire — webase.webfile
+ *       depends on this exact framing.
  *
  * These primitives own no state: each call is a self-contained round-trip
  * over a temporary z_stream. That matches "no unbounded static growth" and

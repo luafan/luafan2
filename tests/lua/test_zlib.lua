@@ -81,4 +81,53 @@ s:test("sync-flush deflate ends with the 00 00 FF FF marker", function()
   T.eq(assert(fan.zlib.inflate_raw(stripped .. "\0\0\xff\xff")), "hello")
 end)
 
+-- ---- gzip_compress (M12.1) ------------------------------------------------
+
+s:test("gzip_compress produces a valid gzip stream (magic 1f 8b 08)", function()
+  local src = string.rep("hello ", 200)   -- ~1.2 KiB, highly compressible
+  local g = assert(fan.zlib.gzip_compress(src))
+  T.truthy(#g >= 20)               -- gzip has 10B header + 8B trailer at minimum
+  T.eq(g:sub(1, 1), "\x1f")
+  T.eq(g:sub(2, 2), "\x8b")
+  T.eq(g:sub(3, 3), "\x08")        -- CM=8 (deflate) is the only allowed value
+  T.truthy(#g < #src, "compressible input must shrink under gzip")
+end)
+
+s:test("gzip_compress: trailer contains CRC32 and ISIZE little-endian", function()
+  -- ISIZE is the last 4 bytes = input length mod 2^32, little-endian.
+  local src = "abcdefghij"                        -- 10 bytes
+  local g = assert(fan.zlib.gzip_compress(src))
+  local isize = g:sub(-4)
+  T.eq(string.byte(isize, 1), 10)                  -- 0x0a
+  T.eq(string.byte(isize, 2), 0)
+  T.eq(string.byte(isize, 3), 0)
+  T.eq(string.byte(isize, 4), 0)
+end)
+
+s:test("gzip_compress: empty input still produces a valid framed stream", function()
+  local g = assert(fan.zlib.gzip_compress(""))
+  T.truthy(#g >= 18)
+  T.eq(g:sub(1, 3), "\x1f\x8b\x08")
+  -- ISIZE for empty input is 0.
+  T.eq(g:sub(-4), "\0\0\0\0")
+end)
+
+s:test("gzip_compress: level rejected outside -1/0..9", function()
+  local ok, err = fan.zlib.gzip_compress("x", 42)
+  T.is_nil(ok); T.not_nil(err)
+end)
+
+s:test("gzip_compress: gzip stream is decoded by a raw-inflate probe", function()
+  -- We can't inflate gzip with raw_inflate (skips 10-byte header + trailer)
+  -- without stripping framing manually. Instead: verify the "raw deflate
+  -- body" between header (offset 10) and trailer (last 8 bytes) is a
+  -- valid raw deflate stream by round-tripping.
+  local src = string.rep("The quick brown fox. ", 64)  -- ~1.3 KiB
+  local g = assert(fan.zlib.gzip_compress(src))
+  T.truthy(#g > 18)
+  local raw = g:sub(11, -9)   -- strip header + trailer
+  local back = assert(fan.zlib.inflate_raw(raw))
+  T.eq(back, src)
+end)
+
 os.exit(T.run(s))

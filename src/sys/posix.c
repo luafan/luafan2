@@ -302,6 +302,69 @@ static int l_readdir(lua_State *L) {
     return 1;
 }
 
+/* ---- stat / lstat (M12.1: webase route/service/mapping/webfile need a
+ *      LuaFileSystem-shaped file attributes call). We surface a subset of
+ *      the fields LFS exposes — the ones v1 code actually reads — plus
+ *      atime/ctime/blksize/blocks so future callers have parity. `mode`
+ *      is a string, matching lfs.attributes(path).mode (v1 code branches
+ *      on the "directory" / "file" strings). Follows symlinks by default;
+ *      pass an opts table with link=true for lstat(2). */
+static const char *stat_mode_string(mode_t m) {
+    if (S_ISREG(m))  return "file";
+    if (S_ISDIR(m))  return "directory";
+    if (S_ISLNK(m))  return "link";
+    if (S_ISSOCK(m)) return "socket";
+    if (S_ISFIFO(m)) return "fifo";
+    if (S_ISCHR(m))  return "char device";
+    if (S_ISBLK(m))  return "block device";
+    return "other";
+}
+
+static int l_stat(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    int use_lstat = 0;
+    if (lua_type(L, 2) == LUA_TTABLE) {
+        lua_getfield(L, 2, "link");
+        use_lstat = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+    }
+    struct stat st;
+    int rc = use_lstat ? lstat(path, &st) : stat(path, &st);
+    if (rc == -1) return push_errno(L, use_lstat ? "lstat" : "stat");
+
+    lua_newtable(L);
+    lua_pushstring(L, stat_mode_string(st.st_mode));
+    lua_setfield(L, -2, "mode");
+    /* Numeric permission bits (0..0777) for callers that need the raw
+     * mode — LFS exposes this as `permissions` but as an octal string;
+     * we keep it as an integer so bitmask checks are cheap. */
+    lua_pushinteger(L, (lua_Integer)(st.st_mode & 07777));
+    lua_setfield(L, -2, "perm");
+    lua_pushinteger(L, (lua_Integer)st.st_size);
+    lua_setfield(L, -2, "size");
+    lua_pushinteger(L, (lua_Integer)st.st_mtime);
+    lua_setfield(L, -2, "mtime");
+    lua_pushinteger(L, (lua_Integer)st.st_atime);
+    lua_setfield(L, -2, "atime");
+    lua_pushinteger(L, (lua_Integer)st.st_ctime);
+    lua_setfield(L, -2, "ctime");
+    lua_pushinteger(L, (lua_Integer)st.st_ino);
+    lua_setfield(L, -2, "ino");
+    lua_pushinteger(L, (lua_Integer)st.st_dev);
+    lua_setfield(L, -2, "dev");
+    lua_pushinteger(L, (lua_Integer)st.st_nlink);
+    lua_setfield(L, -2, "nlink");
+    lua_pushinteger(L, (lua_Integer)st.st_uid);
+    lua_setfield(L, -2, "uid");
+    lua_pushinteger(L, (lua_Integer)st.st_gid);
+    lua_setfield(L, -2, "gid");
+    lua_pushinteger(L, (lua_Integer)st.st_blksize);
+    lua_setfield(L, -2, "blksize");
+    lua_pushinteger(L, (lua_Integer)st.st_blocks);
+    lua_setfield(L, -2, "blocks");
+    return 1;
+}
+
 /* ---- setprogname (Linux only, safe pointer swap) -------------------------- */
 #if defined(FAN_PLATFORM_LINUX)
 extern char *__progname;
@@ -339,6 +402,7 @@ static const luaL_Reg posix_lib[] = {
     {"getinterfaces",  l_getinterfaces},
     {"setprogname",    l_setprogname},
     {"readdir",        l_readdir},
+    {"stat",           l_stat},
     {NULL, NULL},
 };
 

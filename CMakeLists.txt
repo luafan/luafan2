@@ -188,6 +188,8 @@ set(FAN2_LIB_SOURCES
     src/codec/json.c
     src/sys/posix.c
     src/sys/popen.c
+    src/crypto/crypto.c
+    src/crypto/gcm.c
 )
 if(FAN_WITH_SQLITE3)
     list(APPEND FAN2_LIB_SOURCES src/db/sqlite3.c)
@@ -221,7 +223,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     list(APPEND FAN2_DEFS LUA_USE_MACOSX)
 endif()
 
-set(FAN2_INCLUDES src src/util src/runtime src/codec src/db ${LUA_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
+set(FAN2_INCLUDES src src/util src/runtime src/codec src/db src/crypto ${LUA_INCLUDE_DIR} ${EVENT_INCLUDE_DIR})
 
 set(FAN2_LINK_LIBS ${EVENT_LIBRARY})
 if(EVENT_PTHREADS_LIBRARY)

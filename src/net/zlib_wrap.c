@@ -72,6 +72,58 @@ int fan_zlib_deflate_raw_c(const char *in, size_t inlen,
     return 0;
 }
 
+/* gzip framing (windowBits = MAX_WBITS + 16 -> zlib emits gzip header +
+ * trailer). Callers get a self-contained stream — HTTP `Content-Encoding:
+ * gzip` peers can decode it directly. Sync-flush intentionally omitted:
+ * gzip is used here for full-body compression (webfile), not for
+ * incremental frames like permessage-deflate. Errors surface as
+ * (NULL, "message") via the same C shape as deflate_raw_c. */
+static int fan_zlib_gzip_compress_c(const char *in, size_t inlen,
+                                    int level,
+                                    char **out, size_t *outlen,
+                                    const char **errmsg) {
+    if (out) *out = NULL;
+    if (outlen) *outlen = 0;
+    if (level != Z_DEFAULT_COMPRESSION && (level < 0 || level > 9)) {
+        if (errmsg) *errmsg = "level must be -1 or in 0..9";
+        return -1;
+    }
+
+    z_stream s;
+    memset(&s, 0, sizeof(s));
+    int rc = deflateInit2(&s, level, Z_DEFLATED, MAX_WBITS + 16, 8,
+                          Z_DEFAULT_STRATEGY);
+    if (rc != Z_OK) {
+        if (errmsg) *errmsg = "deflateInit2(gzip) failed";
+        return -1;
+    }
+
+    uLong bound = deflateBound(&s, (uLong)inlen);
+    unsigned char *buf = (unsigned char *)malloc(bound);
+    if (!buf) {
+        deflateEnd(&s);
+        if (errmsg) *errmsg = "out of memory";
+        return -1;
+    }
+
+    s.next_in   = (Bytef *)(uintptr_t)in;
+    s.avail_in  = (uInt)inlen;
+    s.next_out  = buf;
+    s.avail_out = (uInt)bound;
+
+    rc = deflate(&s, Z_FINISH);
+    if (rc != Z_STREAM_END) {
+        deflateEnd(&s);
+        free(buf);
+        if (errmsg) *errmsg = "gzip deflate did not finish";
+        return -1;
+    }
+    if (out)    *out    = (char *)buf;
+    if (outlen) *outlen = (size_t)s.total_out;
+    deflateEnd(&s);
+    return 0;
+}
+
 int fan_zlib_inflate_raw_c(const char *in, size_t inlen,
                            char **out, size_t *outlen,
                            const char **errmsg) {
@@ -171,6 +223,22 @@ static int l_inflate_raw(lua_State *L) {
     return 1;
 }
 
+/* fan.zlib.gzip_compress(data [, level]) -> string or nil,err */
+static int l_gzip_compress(lua_State *L) {
+    size_t inlen = 0;
+    const char *in = luaL_checklstring(L, 1, &inlen);
+    int level = (int)luaL_optinteger(L, 2, Z_DEFAULT_COMPRESSION);
+    char *out = NULL; size_t outlen = 0; const char *err = NULL;
+    if (fan_zlib_gzip_compress_c(in, inlen, level, &out, &outlen, &err) != 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, err ? err : "gzip failed");
+        return 2;
+    }
+    lua_pushlstring(L, out, outlen);
+    free(out);
+    return 1;
+}
+
 #else /* !FAN_WITH_ZLIB */
 
 int fan_zlib_available(void) { return 0; }
@@ -205,6 +273,11 @@ static int l_inflate_raw(lua_State *L) {
     lua_pushliteral(L, "zlib not compiled in (build with -DFAN_WITH_ZLIB=ON)");
     return 2;
 }
+static int l_gzip_compress(lua_State *L) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "zlib not compiled in (build with -DFAN_WITH_ZLIB=ON)");
+    return 2;
+}
 
 #endif /* FAN_WITH_ZLIB */
 
@@ -214,9 +287,10 @@ static int l_available(lua_State *L) {
 }
 
 static const luaL_Reg zlib_funcs[] = {
-    {"available",    l_available},
-    {"deflate_raw",  l_deflate_raw},
-    {"inflate_raw",  l_inflate_raw},
+    {"available",     l_available},
+    {"deflate_raw",   l_deflate_raw},
+    {"inflate_raw",   l_inflate_raw},
+    {"gzip_compress", l_gzip_compress},
     {NULL, NULL},
 };
 

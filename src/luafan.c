@@ -38,6 +38,7 @@
 
 #include "sys/posix.h"
 #include "sys/popen.h"
+#include "crypto/crypto.h"
 
 #include <lua.h>
 #include <lauxlib.h>
@@ -384,6 +385,7 @@ int luaopen_fan(lua_State *L) {
 #endif
     fan_posix_register(L);  /* adds fan.posix (POSIX process/CPU/net ifaces) */
     fan_popen_register(L);  /* adds fan.popen (M12) */
+    fan_crypto_register(L); /* adds fan.crypto (M12.1: md5) + fan.crypto.gcm */
     return 1;
 }
 

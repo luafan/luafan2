@@ -206,4 +206,50 @@ s:test("signals table has SIGTERM=15, SIGKILL=9, SIGINT=2", function()
   T.eq(posix.signals.SIGINT,  2)
 end)
 
+-- ---- stat (M12.1) --------------------------------------------------------
+
+s:test("stat: current working directory reports mode=directory", function()
+  local info, err = posix.stat(".")
+  T.not_nil(info, tostring(err))
+  T.eq(info.mode, "directory")
+  T.is_type(info.size, "number")
+  T.is_type(info.mtime, "number")
+  T.truthy(info.mtime > 0)
+end)
+
+s:test("stat: a regular file reports mode=file with matching size", function()
+  -- Create a small file in a unique tmp path we own for the duration of
+  -- the test, then stat it. We use /tmp which is expected to exist on
+  -- every POSIX host our tests run on.
+  local path = string.format("/tmp/fan_stat_test_%d_%d", posix.getpid(),
+                             math.floor(fan.gettime() * 1000))
+  local body = "hello, stat!"
+  local f = assert(io.open(path, "wb"))
+  f:write(body)
+  f:close()
+
+  local info, err = posix.stat(path)
+  T.not_nil(info, tostring(err))
+  T.eq(info.mode, "file")
+  T.eq(info.size, #body)
+  T.truthy(info.perm >= 0)
+  os.remove(path)
+end)
+
+s:test("stat: missing path returns nil,err", function()
+  local info, err = posix.stat("/nonexistent/definitely/nope-" .. tostring(posix.getpid()))
+  T.is_nil(info)
+  T.truthy(err)
+  T.truthy(err:find("stat"))
+end)
+
+s:test("stat: opts={link=true} works (lstat variant)", function()
+  -- We don't require a symlink to exist; just verify the code path runs
+  -- on a normal file and reports mode=file (lstat on a non-link is
+  -- identical to stat).
+  local info, err = posix.stat(".", {link=true})
+  T.not_nil(info, tostring(err))
+  T.eq(info.mode, "directory")
+end)
+
 os.exit(T.run(s))

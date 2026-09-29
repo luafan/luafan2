@@ -20,6 +20,14 @@
  *   fan.posix.setprogname(name)         -> nil     (Linux/glibc only, safe)
  *   fan.posix.readdir(path)             -> {names...} | nil, err, errno
  *      * Returns raw entries including "." and ".."; caller filters.
+ *   fan.posix.stat(path[, opts])        -> {mode,size,mtime,...} | nil, err
+ *      * mode is one of "file", "directory", "link", "socket", "fifo",
+ *        "char device", "block device", "other". size is bytes (regular
+ *        files); mtime is a POSIX epoch integer. Uses stat(2) (follows
+ *        symlinks); pass opts={ link=true } for lstat(2). Extra fields:
+ *        ino, dev, nlink, uid, gid, atime, ctime, blksize, blocks.
+ *        Covers what v1 LuaFileSystem consumers (route/service/mapping/
+ *        webfile) read.
  *
  * Signal name -> number is exposed as fan.posix.signals =
  *   { SIGTERM=15, SIGKILL=9, SIGINT=2, SIGHUP=1, SIGUSR1=..., SIGUSR2=... }
