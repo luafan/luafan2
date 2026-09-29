@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <errno.h>
 
+#include <event2/event.h>
 #include <event2/bufferevent.h>
 #include <event2/buffer.h>
 #include <event2/dns.h>
@@ -617,6 +618,440 @@ static int server_gc(lua_State *L) {
     return 0;
 }
 
+/* ==========================================================================
+ * M17: callback-based async TCP client (fan.tcp.connect_async{...})
+ *
+ * Restores v1 fan.tcpd semantics on top of libevent bufferevent:
+ *   - immediate handle return (unlike the coroutine-yielding fan.tcp.connect)
+ *   - onconnected(self) / onread(self, data) / ondisconnected(self, reason)
+ *   - pre-connect send queue: conn:send() before onconnected buffers into the
+ *     bufferevent output queue; libevent flushes on connect
+ *   - close mid-connect race: ondisconnected(self, "closed") fires exactly once
+ *     via the `dispatched_disc` flag; onconnected never fires post-close
+ *   - reconnect(): tear the bev down and rebuild it to the same host:port
+ *
+ * Not in M17-1 (arrive in M17-2/-3):
+ *   - connect_timeout / read_timeout / write_timeout
+ *   - onsendready
+ *   - ssl_host / cainfo / capath / ssl_verifyhost / ssl_verifypeer / pkcs12
+ *   - evdns
+ *   - server-side bind_async
+ *
+ * Rejected in M17-1 already (v2 has no notion of these):
+ *   - worker (multi-loop-in-process not available in v2)
+ *   - callback_self_first (callbacks always take self as the first argument)
+ * ========================================================================== */
+#define TCP_ASYNC_CONN_MT "fan.tcp.async_conn"
+
+typedef struct {
+    struct bufferevent *bev;
+    /* Reconnect uses these to rebuild the bev. */
+    char *host;
+    int   port;
+    int   use_ssl;
+    int   verify_peer;
+    int   verify_host;
+
+    /* Lua registry refs — LUA_NOREF when absent. */
+    int on_connected_ref;
+    int on_read_ref;
+    int on_disc_ref;
+    int self_ref;          /* pin the userdata across in-flight callbacks */
+
+    /* State machine flags — mutually consistent, not enum. */
+    int connecting;        /* connect_hostname issued, waiting for CONNECTED */
+    int connected;         /* handshake done, callbacks can fire */
+    int closed;            /* user called close() */
+    int dispatched_disc;   /* ondisconnected has fired (exactly-once guard) */
+} tcp_async_conn_t;
+
+/* forward */
+static void async_conn_readcb(struct bufferevent *bev, void *arg);
+static void async_conn_eventcb(struct bufferevent *bev, short what, void *arg);
+static int  async_conn_rebuild_bev(tcp_async_conn_t *c, const char **err);
+
+/* Dispatch a callback: create a coroutine, push fn + args, resume + unref.
+ * `ref` is the registry pin for the fn to invoke; leaves the fn registered.
+ * `push_args(co, ud)` pushes the callback arguments onto `co`; returns nargs. */
+static void async_dispatch(tcp_async_conn_t *c, int cb_ref,
+                           int (*push_args)(lua_State *, tcp_async_conn_t *)) {
+    if (cb_ref == LUA_NOREF) return;
+    lua_State *L = g_main_L;
+    if (!L) return;   /* teardown window; drop the callback silently */
+    lua_State *co = lua_newthread(L);
+    lua_pushvalue(L, -1);
+    int co_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_pop(L, 1);
+    lua_rawgeti(co, LUA_REGISTRYINDEX, cb_ref);   /* fn */
+    int nargs = push_args(co, c);
+    fan_coro_wake(L, co, co_ref, nargs);
+}
+
+/* Push `self` (the async conn userdata) as arg 1. */
+static int async_push_self(lua_State *co, tcp_async_conn_t *c) {
+    if (c->self_ref != LUA_NOREF) {
+        lua_rawgeti(co, LUA_REGISTRYINDEX, c->self_ref);
+    } else {
+        lua_pushnil(co);
+    }
+    return 1;
+}
+
+/* Push `self` + a stashed string (allocated in the caller). */
+typedef struct { tcp_async_conn_t *c; const char *reason; } async_disc_args_t;
+static __thread async_disc_args_t g_disc_args;   /* single-threaded dispatch */
+static int async_push_self_and_reason(lua_State *co, tcp_async_conn_t *c) {
+    (void)c;
+    if (g_disc_args.c && g_disc_args.c->self_ref != LUA_NOREF) {
+        lua_rawgeti(co, LUA_REGISTRYINDEX, g_disc_args.c->self_ref);
+    } else {
+        lua_pushnil(co);
+    }
+    lua_pushstring(co, g_disc_args.reason ? g_disc_args.reason : "");
+    return 2;
+}
+
+/* Stash for the onread dispatch: we consume all currently-available bytes
+ * from the input evbuffer, push {self, data}, and hand off. */
+typedef struct { tcp_async_conn_t *c; char *data; size_t len; } async_read_args_t;
+static __thread async_read_args_t g_read_args;
+static int async_push_self_and_data(lua_State *co, tcp_async_conn_t *c) {
+    (void)c;
+    if (g_read_args.c && g_read_args.c->self_ref != LUA_NOREF) {
+        lua_rawgeti(co, LUA_REGISTRYINDEX, g_read_args.c->self_ref);
+    } else {
+        lua_pushnil(co);
+    }
+    lua_pushlstring(co, g_read_args.data, g_read_args.len);
+    return 2;
+}
+
+/* Fire ondisconnected exactly once. Idempotent: subsequent calls are no-ops.
+ * Releases the self-pin AFTER the dispatch so the callback sees a valid self.
+ * `reason` is copied into the thread-local stash for the duration of the
+ * dispatch call (which is synchronous from our POV — fan_coro_wake resumes
+ * the fresh coroutine inline). */
+static void async_fire_disc(tcp_async_conn_t *c, const char *reason) {
+    if (c->dispatched_disc) return;
+    c->dispatched_disc = 1;
+    int cb = c->on_disc_ref;
+    g_disc_args.c = c;
+    g_disc_args.reason = reason;
+    async_dispatch(c, cb, async_push_self_and_reason);
+    g_disc_args.c = NULL;
+    g_disc_args.reason = NULL;
+    /* Release the self-pin so GC can collect the conn once user drops it. */
+    if (c->self_ref != LUA_NOREF) {
+        int r = c->self_ref;
+        c->self_ref = LUA_NOREF;
+        fan_unref_safe(g_main_L, r);
+    }
+}
+
+static void async_conn_readcb(struct bufferevent *bev, void *arg) {
+    tcp_async_conn_t *c = (tcp_async_conn_t *)arg;
+    if (c->closed || c->dispatched_disc) return;
+    struct evbuffer *in = bufferevent_get_input(bev);
+    size_t avail = evbuffer_get_length(in);
+    if (avail == 0) return;
+    if (c->on_read_ref == LUA_NOREF) {
+        /* drain silently so we do not spin on the readable event */
+        evbuffer_drain(in, avail);
+        return;
+    }
+    char *tmp = (char *)malloc(avail);
+    if (!tmp) return;    /* OOM: leave data in buffer; next event may retry */
+    evbuffer_remove(in, tmp, avail);
+    g_read_args.c = c;
+    g_read_args.data = tmp;
+    g_read_args.len = avail;
+    async_dispatch(c, c->on_read_ref, async_push_self_and_data);
+    g_read_args.c = NULL;
+    g_read_args.data = NULL;
+    g_read_args.len = 0;
+    free(tmp);
+}
+
+static void async_conn_eventcb(struct bufferevent *bev, short what, void *arg) {
+    (void)bev;
+    tcp_async_conn_t *c = (tcp_async_conn_t *)arg;
+    if (what & BEV_EVENT_CONNECTED) {
+        if (c->closed || c->dispatched_disc) return;
+        c->connecting = 0;
+        c->connected = 1;
+        async_dispatch(c, c->on_connected_ref, async_push_self);
+        return;
+    }
+    if (what & (BEV_EVENT_EOF | BEV_EVENT_ERROR | BEV_EVENT_TIMEOUT)) {
+        const char *reason =
+            (what & BEV_EVENT_EOF)     ? "eof" :
+            (what & BEV_EVENT_TIMEOUT) ? "timeout" :
+                                         "error";
+        c->connecting = 0;
+        c->connected = 0;
+        async_fire_disc(c, reason);
+    }
+}
+
+/* Build a fresh bufferevent for the async conn using the stored host/port and
+ * SSL parameters. Used by both the initial connect and reconnect(). On failure
+ * returns -1 and *err is set to a static message. */
+static int async_conn_rebuild_bev(tcp_async_conn_t *c, const char **err) {
+    struct event_base *base = fan_loop_current_base();
+    struct evdns_base *dns = fan_loop_dnsbase();
+    struct bufferevent *bev;
+    if (c->use_ssl) {
+        const char *terr = NULL;
+        bev = fan_tls_client_bev(base, c->host, c->verify_peer, c->verify_host, &terr);
+        if (!bev) { if (err) *err = terr ? terr : "tls init failed"; return -1; }
+    } else {
+        bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
+        if (!bev) { if (err) *err = "bufferevent_socket_new failed"; return -1; }
+    }
+    c->bev = bev;
+    bufferevent_setcb(bev, async_conn_readcb, NULL, async_conn_eventcb, c);
+    bufferevent_enable(bev, EV_READ | EV_WRITE);
+    if (bufferevent_socket_connect_hostname(bev, dns, AF_UNSPEC, c->host, c->port) < 0) {
+        bufferevent_free(bev);
+        c->bev = NULL;
+        if (err) *err = "connect dispatch failed";
+        return -1;
+    }
+    c->connecting = 1;
+    return 0;
+}
+
+/* ---- fan.tcp.connect_async{...} ------------------------------------------ */
+static int l_connect_async(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+
+    /* Reject fields we intentionally do not support in v2. */
+    lua_getfield(L, 1, "worker");
+    if (!lua_isnil(L, -1)) {
+        return luaL_error(L,
+            "fan.tcp.connect_async: the `worker` field is not supported "
+            "(v2 has no in-process worker event bases)");
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "callback_self_first");
+    if (!lua_isnil(L, -1)) {
+        return luaL_error(L,
+            "fan.tcp.connect_async: the `callback_self_first` field is not "
+            "supported; callbacks always receive `self` as the first argument");
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "host");
+    const char *host = luaL_checkstring(L, -1);
+    lua_getfield(L, 1, "port");
+    int port = (int)luaL_checkinteger(L, -1);
+    if (port < 1 || port > 65535) return luaL_error(L, "port out of range");
+    lua_pop(L, 2);
+
+    int use_ssl = 0, verify_peer = 1, verify_host = 1;
+    lua_getfield(L, 1, "ssl");
+    use_ssl = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "ssl_verifypeer");
+    if (!lua_isnil(L, -1)) verify_peer = lua_tointeger(L, -1) != 0;
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "ssl_verifyhost");
+    if (!lua_isnil(L, -1)) verify_host = lua_tointeger(L, -1) != 0;
+    lua_pop(L, 1);
+
+    /* Pin the three callbacks before we build state we would need to unwind
+     * on failure. */
+    int on_connected = LUA_NOREF, on_read = LUA_NOREF, on_disc = LUA_NOREF;
+    lua_getfield(L, 1, "onconnected");
+    if (lua_isfunction(L, -1)) on_connected = luaL_ref(L, LUA_REGISTRYINDEX);
+    else lua_pop(L, 1);
+    lua_getfield(L, 1, "onread");
+    if (lua_isfunction(L, -1)) on_read = luaL_ref(L, LUA_REGISTRYINDEX);
+    else lua_pop(L, 1);
+    lua_getfield(L, 1, "ondisconnected");
+    if (lua_isfunction(L, -1)) on_disc = luaL_ref(L, LUA_REGISTRYINDEX);
+    else lua_pop(L, 1);
+
+    /* Allocate the userdata. */
+    tcp_async_conn_t *c = (tcp_async_conn_t *)lua_newuserdata(L, sizeof(*c));
+    memset(c, 0, sizeof(*c));
+    c->host = strdup(host);
+    c->port = port;
+    c->use_ssl = use_ssl;
+    c->verify_peer = verify_peer;
+    c->verify_host = verify_host;
+    c->on_connected_ref = on_connected;
+    c->on_read_ref = on_read;
+    c->on_disc_ref = on_disc;
+    c->self_ref = LUA_NOREF;
+    luaL_getmetatable(L, TCP_ASYNC_CONN_MT);
+    lua_setmetatable(L, -2);
+
+    /* Pin the userdata itself so the eventcb can dispatch callbacks with a
+     * live self even after the caller drops the local. Released either by
+     * async_fire_disc or by close() (which fires disc synthetically). */
+    lua_pushvalue(L, -1);
+    c->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    /* Kick off the connect. On dispatch failure, schedule a disc(self,reason)
+     * via the loop rather than reporting synchronously — v1 fan.tcpd returns
+     * the handle first and reports build failures through ondisconnected. */
+    const char *berr = NULL;
+    if (async_conn_rebuild_bev(c, &berr) != 0) {
+        /* We cannot fire the callback synchronously (caller has not received
+         * the handle yet, so `self` is not what they hold). Defer to next
+         * loop tick via event_base_once. Simpler alternative: return the
+         * handle now and rely on the caller to hit send() before we fire —
+         * but the v1 contract is "handle first, disc later". Use a zero-
+         * timeout timer. */
+        struct event_base *base = fan_loop_current_base();
+        struct timeval zero = {0, 0};
+        /* We stash reason on the struct itself because event_base_once has
+         * no user arg pass-through for a strdup we do not want to leak. */
+        c->connecting = 0;
+        /* Fire disc from a stub. We reuse a one-shot timer. */
+        struct { tcp_async_conn_t *c; const char *reason; } *args =
+            (void *)malloc(sizeof(*args));
+        if (args) {
+            args->c = c;
+            args->reason = strdup(berr ? berr : "build failed");
+            /* Note: v2 tcp.c does not currently need this pattern elsewhere;
+             * we invoke event_base_once from libevent to defer. */
+            extern void fan_tcp_async_deferred_disc(evutil_socket_t, short, void *);
+            event_base_once(base, -1, EV_TIMEOUT, fan_tcp_async_deferred_disc,
+                            args, &zero);
+        }
+    }
+    /* Return the handle. */
+    return 1;
+}
+
+/* One-shot timer callback for deferred build-failure ondisconnected. */
+void fan_tcp_async_deferred_disc(evutil_socket_t fd, short what, void *arg) {
+    (void)fd; (void)what;
+    struct { tcp_async_conn_t *c; const char *reason; } *args = arg;
+    tcp_async_conn_t *c = args->c;
+    const char *reason = args->reason;
+    if (!c->closed) async_fire_disc(c, reason);
+    free((void *)reason);
+    free(args);
+}
+
+/* ---- async conn:send(data) — buffers even before onconnected ------------ */
+static int l_async_send(lua_State *L) {
+    tcp_async_conn_t *c = (tcp_async_conn_t *)luaL_checkudata(L, 1, TCP_ASYNC_CONN_MT);
+    size_t len; const char *data = luaL_checklstring(L, 2, &len);
+    if (c->closed || !c->bev) {
+        lua_pushnil(L); lua_pushstring(L, "closed"); return 2;
+    }
+    /* bufferevent_write accepts writes before CONNECTED and flushes them
+     * automatically once the socket is writable — this is the C-side
+     * pre-connect send queue. */
+    if (bufferevent_write(c->bev, data, len) != 0) {
+        lua_pushnil(L); lua_pushstring(L, "write failed"); return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* ---- async conn:close() ------------------------------------------------- */
+static int l_async_close(lua_State *L) {
+    tcp_async_conn_t *c = (tcp_async_conn_t *)luaL_checkudata(L, 1, TCP_ASYNC_CONN_MT);
+    if (c->closed) return 0;
+    c->closed = 1;
+    if (c->bev) { bufferevent_free(c->bev); c->bev = NULL; }
+    /* v1 contract: close() also fires ondisconnected(self, "closed") — makes
+     * downstream state-machine cleanup uniform (one path for both peer-driven
+     * and local-driven disconnect). Skip if we already fired for another
+     * reason (race between remote EOF and local close). */
+    if (!c->dispatched_disc) async_fire_disc(c, "closed");
+    return 0;
+}
+
+/* ---- async conn:reconnect() --------------------------------------------- */
+static int l_async_reconnect(lua_State *L) {
+    tcp_async_conn_t *c = (tcp_async_conn_t *)luaL_checkudata(L, 1, TCP_ASYNC_CONN_MT);
+    if (c->closed) { lua_pushnil(L); lua_pushstring(L, "closed"); return 2; }
+    if (c->bev) { bufferevent_free(c->bev); c->bev = NULL; }
+    c->connecting = 0;
+    c->connected = 0;
+    c->dispatched_disc = 0;
+    /* Re-pin self if it was released by a prior ondisconnected fire. */
+    if (c->self_ref == LUA_NOREF) {
+        lua_pushvalue(L, 1);
+        c->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    const char *berr = NULL;
+    if (async_conn_rebuild_bev(c, &berr) != 0) {
+        lua_pushnil(L); lua_pushstring(L, berr ? berr : "reconnect failed");
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* ---- async conn: getpeername / getsockname / pause_read / resume_read /
+ *      shutdown — thin wrappers that mostly mirror the sync path. */
+static int l_async_getaddr(lua_State *L, int peer) {
+    tcp_async_conn_t *c = (tcp_async_conn_t *)luaL_checkudata(L, 1, TCP_ASYNC_CONN_MT);
+    if (!c->bev) { lua_pushnil(L); lua_pushstring(L, "closed"); return 2; }
+    evutil_socket_t fd = bufferevent_getfd(c->bev);
+    if (fd < 0) { lua_pushnil(L); lua_pushstring(L, "no fd"); return 2; }
+    struct sockaddr_storage ss;
+    socklen_t sl = (socklen_t)sizeof(ss);
+    int rc = peer ? getpeername(fd, (struct sockaddr *)&ss, &sl)
+                  : getsockname(fd, (struct sockaddr *)&ss, &sl);
+    if (rc != 0) { lua_pushnil(L); lua_pushstring(L, strerror(errno)); return 2; }
+    char ipbuf[64] = {0};
+    unsigned port = 0;
+    if (ss.ss_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+        inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf));
+        port = ntohs(sin->sin_port);
+    } else if (ss.ss_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, ipbuf, sizeof(ipbuf));
+        port = ntohs(sin6->sin6_port);
+    }
+    lua_pushstring(L, ipbuf);
+    lua_pushinteger(L, (lua_Integer)port);
+    return 2;
+}
+static int l_async_getpeername(lua_State *L) { return l_async_getaddr(L, 1); }
+static int l_async_getsockname(lua_State *L) { return l_async_getaddr(L, 0); }
+
+static int l_async_pause_read(lua_State *L) {
+    tcp_async_conn_t *c = (tcp_async_conn_t *)luaL_checkudata(L, 1, TCP_ASYNC_CONN_MT);
+    if (c->bev && !c->closed) bufferevent_disable(c->bev, EV_READ);
+    return 0;
+}
+static int l_async_resume_read(lua_State *L) {
+    tcp_async_conn_t *c = (tcp_async_conn_t *)luaL_checkudata(L, 1, TCP_ASYNC_CONN_MT);
+    if (c->bev && !c->closed) bufferevent_enable(c->bev, EV_READ);
+    return 0;
+}
+static int l_async_shutdown(lua_State *L) {
+    tcp_async_conn_t *c = (tcp_async_conn_t *)luaL_checkudata(L, 1, TCP_ASYNC_CONN_MT);
+    if (c->bev) {
+        evutil_socket_t fd = bufferevent_getfd(c->bev);
+        if (fd >= 0) shutdown(fd, SHUT_WR);
+    }
+    return 0;
+}
+
+static int async_conn_gc(lua_State *L) {
+    tcp_async_conn_t *c = (tcp_async_conn_t *)luaL_checkudata(L, 1, TCP_ASYNC_CONN_MT);
+    if (c->bev) { bufferevent_free(c->bev); c->bev = NULL; }
+    if (c->host) { free(c->host); c->host = NULL; }
+    if (c->on_connected_ref != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_connected_ref); c->on_connected_ref = LUA_NOREF; }
+    if (c->on_read_ref != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_read_ref); c->on_read_ref = LUA_NOREF; }
+    if (c->on_disc_ref != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_disc_ref); c->on_disc_ref = LUA_NOREF; }
+    /* self_ref should already be gone by the time __gc runs (it was the only
+     * strong root that kept us alive); if it lingers, drop it. */
+    if (c->self_ref != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->self_ref); c->self_ref = LUA_NOREF; }
+    return 0;
+}
+
 /*
  * fan_tcp_clear_lua_state — teardown hook invoked immediately before the
  * owning `lua_close(L)`. NULLs out the cached main-thread pointer so any
@@ -664,6 +1099,18 @@ static const luaL_Reg conn_methods[] = {
     {NULL, NULL},
 };
 
+static const luaL_Reg async_conn_methods[] = {
+    {"send",         l_async_send},
+    {"close",        l_async_close},
+    {"reconnect",    l_async_reconnect},
+    {"shutdown",     l_async_shutdown},
+    {"pause_read",   l_async_pause_read},
+    {"resume_read",  l_async_resume_read},
+    {"getsockname",  l_async_getsockname},
+    {"getpeername",  l_async_getpeername},
+    {NULL, NULL},
+};
+
 static const luaL_Reg server_methods[] = {
     {"close",   l_server_close},
     {"getport", l_server_getport},
@@ -671,8 +1118,9 @@ static const luaL_Reg server_methods[] = {
 };
 
 static const luaL_Reg tcp_funcs[] = {
-    {"connect", l_connect},
-    {"bind",    l_bind},
+    {"connect",       l_connect},
+    {"connect_async", l_connect_async},
+    {"bind",          l_bind},
     {NULL, NULL},
 };
 
@@ -689,6 +1137,19 @@ void fan_tcp_register(lua_State *L) {
     luaL_register(L, NULL, conn_methods);
 #endif
     lua_pushcfunction(L, conn_gc);
+    lua_setfield(L, -2, "__gc");
+    lua_pop(L, 1);
+
+    /* async conn metatable (M17: fan.tcp.connect_async result handle) */
+    luaL_newmetatable(L, TCP_ASYNC_CONN_MT);
+    lua_pushvalue(L, -1);
+    lua_setfield(L, -2, "__index");
+#if LUA_VERSION_NUM >= 502
+    luaL_setfuncs(L, async_conn_methods, 0);
+#else
+    luaL_register(L, NULL, async_conn_methods);
+#endif
+    lua_pushcfunction(L, async_conn_gc);
     lua_setfield(L, -2, "__gc");
     lua_pop(L, 1);
 
