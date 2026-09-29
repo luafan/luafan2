@@ -17,6 +17,12 @@ not planning notes.
 - [Webase](webase.md) — M12.2 web application framework ported from
   v1's tmp/webase/, with LRU + mapping + service registry.
 
+## Database
+- [fan.sqlite3](sqlite3.md) — M5 + M16.1 native SQLite3 binding.
+  Zero LuaRocks dependencies; drop-in replacement for the `lsqlite3`
+  binding (matching API names, numeric result codes, iterator shapes,
+  named parameters, column metadata).
+
 ## Test coverage
 - [Coverage — latest run](coverage-latest.md) — most recent
   C + Lua line coverage numbers with target thresholds.
