@@ -7,6 +7,7 @@
 #include "../runtime/loop.h"
 #include "../runtime/coro.h"
 #include "tls.h"
+#include "evdns.h"
 
 #include <lauxlib.h>
 #include <stdio.h>
@@ -652,6 +653,38 @@ typedef struct {
     int   verify_peer;
     int   verify_host;
 
+    /* M17-2: TLS parameter surface — all strdup'd copies, freed in __gc.  NULL
+     * means "not set", passed through to fan_tls_client_bev_ex which then
+     * either falls back to defaults (cainfo/capath) or skips the option
+     * entirely (ssl_host / pkcs12_path). */
+    char *ssl_host;
+    char *cainfo;
+    char *capath;
+    char *pkcs12_path;
+    char *pkcs12_password;
+
+    /* M17-2: timeouts in milliseconds; 0 means "no timeout" (v1 parity).
+     * read/write are enforced by libevent via bufferevent_set_timeouts.
+     * connect is enforced by an independent one-shot timer armed at connect
+     * time and disarmed on CONNECTED / disc; without it a stuck SYN would
+     * only fire read/write timeouts, which do not cover the SYN state. */
+    int connect_timeout_ms;
+    int read_timeout_ms;
+    int write_timeout_ms;
+    struct event *connect_timer;   /* NULL when disarmed */
+
+    /* M17-2: onsendready dispatched from bufferevent's writecb when the
+     * output buffer drains to empty.  writecb is only armed while the caller
+     * has registered onsendready (otherwise we skip the callback slot in
+     * bufferevent_setcb to save the dispatch cost). */
+    int on_sendready_ref;
+
+    /* M17-2: caller-supplied evdns_base.  If NULL we fall back to
+     * fan_loop_dnsbase().  We pin the fan.evdns userdata (evdns_ref) to keep
+     * the base alive for the connection lifetime; unref in __gc / disc. */
+    struct evdns_base *dnsbase;
+    int                evdns_ref;
+
     /* Lua registry refs — LUA_NOREF when absent. */
     int on_connected_ref;
     int on_read_ref;
@@ -772,6 +805,45 @@ static void async_conn_readcb(struct bufferevent *bev, void *arg) {
     free(tmp);
 }
 
+/* M17-2: bufferevent write callback.  Fires each time the output evbuffer
+ * transitions to empty; that is our "send-ready" signal.  Only armed when
+ * the caller registered onsendready (otherwise we would pay dispatch cost
+ * for every full-drain even though no one listens). */
+static void async_conn_writecb(struct bufferevent *bev, void *arg) {
+    tcp_async_conn_t *c = (tcp_async_conn_t *)arg;
+    if (c->closed || c->dispatched_disc) return;
+    if (c->on_sendready_ref == LUA_NOREF) return;
+    /* Only fire when the buffer really is empty — libevent's watermark
+     * default (write low = 0) means writecb triggers on drain-to-empty, so
+     * this is just belt-and-braces. */
+    if (evbuffer_get_length(bufferevent_get_output(bev)) != 0) return;
+    async_dispatch(c, c->on_sendready_ref, async_push_self);
+}
+
+/* M17-2: disarm and free the connect-timeout timer if it exists.
+ * Idempotent; safe to call at any point in the state machine. */
+static void async_conn_disarm_connect_timer(tcp_async_conn_t *c) {
+    if (!c->connect_timer) return;
+    event_del(c->connect_timer);
+    event_free(c->connect_timer);
+    c->connect_timer = NULL;
+}
+
+/* M17-2: one-shot connect_timeout callback.  Fires only if the socket has
+ * not yet transitioned to CONNECTED by the deadline; releases the bev and
+ * dispatches ondisconnected(reason="timeout"). */
+static void async_conn_connect_timer_cb(evutil_socket_t fd, short what, void *arg) {
+    (void)fd; (void)what;
+    tcp_async_conn_t *c = (tcp_async_conn_t *)arg;
+    /* If we already connected, closed, or fired disc, the timer is stale. */
+    if (c->closed || c->connected || c->dispatched_disc) return;
+    /* Tear down the pending bev — otherwise a later CONNECTED / ERROR event
+     * would fire against a conn that has already dispatched disc. */
+    if (c->bev) { bufferevent_free(c->bev); c->bev = NULL; }
+    c->connecting = 0;
+    async_fire_disc(c, "connect_timeout");
+}
+
 static void async_conn_eventcb(struct bufferevent *bev, short what, void *arg) {
     (void)bev;
     tcp_async_conn_t *c = (tcp_async_conn_t *)arg;
@@ -779,16 +851,22 @@ static void async_conn_eventcb(struct bufferevent *bev, short what, void *arg) {
         if (c->closed || c->dispatched_disc) return;
         c->connecting = 0;
         c->connected = 1;
+        /* Handshake done: the connect_timeout guard is no longer needed. */
+        async_conn_disarm_connect_timer(c);
         async_dispatch(c, c->on_connected_ref, async_push_self);
         return;
     }
     if (what & (BEV_EVENT_EOF | BEV_EVENT_ERROR | BEV_EVENT_TIMEOUT)) {
+        /* A libevent BEV_EVENT_TIMEOUT here is a *read/write* timeout,
+         * fired via bufferevent_set_timeouts.  connect_timeout is delivered
+         * separately through async_conn_connect_timer_cb (see above). */
         const char *reason =
             (what & BEV_EVENT_EOF)     ? "eof" :
             (what & BEV_EVENT_TIMEOUT) ? "timeout" :
                                          "error";
         c->connecting = 0;
         c->connected = 0;
+        async_conn_disarm_connect_timer(c);
         async_fire_disc(c, reason);
     }
 }
@@ -798,19 +876,53 @@ static void async_conn_eventcb(struct bufferevent *bev, short what, void *arg) {
  * returns -1 and *err is set to a static message. */
 static int async_conn_rebuild_bev(tcp_async_conn_t *c, const char **err) {
     struct event_base *base = fan_loop_current_base();
-    struct evdns_base *dns = fan_loop_dnsbase();
+    /* M17-2: prefer a caller-supplied evdns_base (via `evdns = ...` in the
+     * option table) so downstream code can point at a custom resolver; fall
+     * back to the loop's default. */
+    struct evdns_base *dns = c->dnsbase ? c->dnsbase : fan_loop_dnsbase();
     struct bufferevent *bev;
     if (c->use_ssl) {
+        /* M17-2: fan_tls_client_bev_ex handles the extended TLS parameter
+         * surface (ssl_host / cainfo / capath / pkcs12).  NULL fields
+         * degrade to the same behaviour as the legacy fan_tls_client_bev. */
         const char *terr = NULL;
-        bev = fan_tls_client_bev(base, c->host, c->verify_peer, c->verify_host, &terr);
+        bev = fan_tls_client_bev_ex(base, c->host, c->ssl_host,
+                                    c->verify_peer, c->verify_host,
+                                    c->cainfo, c->capath,
+                                    c->pkcs12_path, c->pkcs12_password,
+                                    &terr);
         if (!bev) { if (err) *err = terr ? terr : "tls init failed"; return -1; }
     } else {
         bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
         if (!bev) { if (err) *err = "bufferevent_socket_new failed"; return -1; }
     }
     c->bev = bev;
-    bufferevent_setcb(bev, async_conn_readcb, NULL, async_conn_eventcb, c);
+
+    /* M17-2: writecb only when onsendready is set.  Passing NULL as the
+     * writecb slot to bufferevent_setcb avoids the (small) per-drain
+     * dispatch overhead in the far more common no-onsendready case. */
+    bufferevent_data_cb wcb =
+        (c->on_sendready_ref != LUA_NOREF) ? async_conn_writecb : NULL;
+    bufferevent_setcb(bev, async_conn_readcb, wcb, async_conn_eventcb, c);
     bufferevent_enable(bev, EV_READ | EV_WRITE);
+
+    /* M17-2: read / write timeouts.  bufferevent_set_timeouts takes two
+     * struct timeval* — NULL for either slot means "disabled".  Zero
+     * timeouts (ms == 0) map to NULL to preserve v1's "0 = disabled". */
+    if (c->read_timeout_ms > 0 || c->write_timeout_ms > 0) {
+        struct timeval rtv = {
+            c->read_timeout_ms / 1000,
+            (c->read_timeout_ms % 1000) * 1000,
+        };
+        struct timeval wtv = {
+            c->write_timeout_ms / 1000,
+            (c->write_timeout_ms % 1000) * 1000,
+        };
+        bufferevent_set_timeouts(bev,
+            c->read_timeout_ms  > 0 ? &rtv : NULL,
+            c->write_timeout_ms > 0 ? &wtv : NULL);
+    }
+
     if (bufferevent_socket_connect_hostname(bev, dns, AF_UNSPEC, c->host, c->port) < 0) {
         bufferevent_free(bev);
         c->bev = NULL;
@@ -818,6 +930,22 @@ static int async_conn_rebuild_bev(tcp_async_conn_t *c, const char **err) {
         return -1;
     }
     c->connecting = 1;
+
+    /* M17-2: arm the connect_timeout timer.  bufferevent read/write timeouts
+     * only apply post-handshake; a stuck SYN or slow TLS negotiation needs
+     * this independent guard.  Zero means disabled. */
+    if (c->connect_timeout_ms > 0) {
+        struct timeval ctv = {
+            c->connect_timeout_ms / 1000,
+            (c->connect_timeout_ms % 1000) * 1000,
+        };
+        c->connect_timer = event_new(base, -1, 0,
+                                     async_conn_connect_timer_cb, c);
+        if (c->connect_timer) event_add(c->connect_timer, &ctv);
+        /* Timer alloc failure is non-fatal: worst case the caller does not
+         * see a connect_timeout event, but read/write timeouts still cover
+         * post-handshake progress. */
+    }
     return 0;
 }
 
@@ -859,14 +987,75 @@ static int l_connect_async(lua_State *L) {
     if (!lua_isnil(L, -1)) verify_host = lua_tointeger(L, -1) != 0;
     lua_pop(L, 1);
 
-    /* Pin the three callbacks before we build state we would need to unwind
+    /* M17-2: extended TLS parameter surface.  strdup each string as we
+     * see it so the ownership boundary is clean: everything below owns
+     * heap-allocated copies, and the option-table Lua strings can be popped
+     * immediately.  NULL means "not set", which lines up with the conn
+     * userdata's memset(0) so no explicit re-nulling is needed. */
+    char *ssl_host_dup = NULL, *cainfo_dup = NULL, *capath_dup = NULL;
+    lua_getfield(L, 1, "ssl_host");
+    if (lua_isstring(L, -1)) ssl_host_dup = strdup(lua_tostring(L, -1));
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "cainfo");
+    if (lua_isstring(L, -1)) cainfo_dup   = strdup(lua_tostring(L, -1));
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "capath");
+    if (lua_isstring(L, -1)) capath_dup   = strdup(lua_tostring(L, -1));
+    lua_pop(L, 1);
+    /* pkcs12 = { path = ..., password = ... } is a nested table.  Extract
+     * both children then pop the outer table. */
+    char *pkcs12_path_dup = NULL, *pkcs12_password_dup = NULL;
+    lua_getfield(L, 1, "pkcs12");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "path");
+        if (lua_isstring(L, -1)) pkcs12_path_dup = strdup(lua_tostring(L, -1));
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "password");
+        if (lua_isstring(L, -1)) pkcs12_password_dup = strdup(lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+
+    /* M17-2: timeouts.  v1 fan.tcpd took seconds as a Lua number (may be
+     * fractional); convert to milliseconds and store as int for the timer
+     * arithmetic.  0 (unset field) means "no timeout" — v1 parity. */
+    int connect_timeout_ms = 0, read_timeout_ms = 0, write_timeout_ms = 0;
+    lua_getfield(L, 1, "connect_timeout");
+    if (lua_isnumber(L, -1)) connect_timeout_ms = (int)(lua_tonumber(L, -1) * 1000);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "read_timeout");
+    if (lua_isnumber(L, -1)) read_timeout_ms = (int)(lua_tonumber(L, -1) * 1000);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "write_timeout");
+    if (lua_isnumber(L, -1)) write_timeout_ms = (int)(lua_tonumber(L, -1) * 1000);
+    lua_pop(L, 1);
+
+    /* M17-2: caller-supplied evdns_base.  Pin the userdata so its __gc
+     * cannot free the base while our connection still holds it. */
+    int evdns_ref = LUA_NOREF;
+    struct evdns_base *dnsbase = NULL;
+    lua_getfield(L, 1, "evdns");
+    if (!lua_isnil(L, -1)) {
+        dnsbase = fan_evdns_get_base(L, -1);
+        if (dnsbase) {
+            lua_pushvalue(L, -1);
+            evdns_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        }
+    }
+    lua_pop(L, 1);
+
+    /* Pin the four callbacks before we build state we would need to unwind
      * on failure. */
     int on_connected = LUA_NOREF, on_read = LUA_NOREF, on_disc = LUA_NOREF;
+    int on_sendready = LUA_NOREF;
     lua_getfield(L, 1, "onconnected");
     if (lua_isfunction(L, -1)) on_connected = luaL_ref(L, LUA_REGISTRYINDEX);
     else lua_pop(L, 1);
     lua_getfield(L, 1, "onread");
     if (lua_isfunction(L, -1)) on_read = luaL_ref(L, LUA_REGISTRYINDEX);
+    else lua_pop(L, 1);
+    lua_getfield(L, 1, "onsendready");
+    if (lua_isfunction(L, -1)) on_sendready = luaL_ref(L, LUA_REGISTRYINDEX);
     else lua_pop(L, 1);
     lua_getfield(L, 1, "ondisconnected");
     if (lua_isfunction(L, -1)) on_disc = luaL_ref(L, LUA_REGISTRYINDEX);
@@ -880,9 +1069,20 @@ static int l_connect_async(lua_State *L) {
     c->use_ssl = use_ssl;
     c->verify_peer = verify_peer;
     c->verify_host = verify_host;
+    c->ssl_host        = ssl_host_dup;
+    c->cainfo          = cainfo_dup;
+    c->capath          = capath_dup;
+    c->pkcs12_path     = pkcs12_path_dup;
+    c->pkcs12_password = pkcs12_password_dup;
+    c->connect_timeout_ms = connect_timeout_ms;
+    c->read_timeout_ms    = read_timeout_ms;
+    c->write_timeout_ms   = write_timeout_ms;
+    c->dnsbase   = dnsbase;
+    c->evdns_ref = evdns_ref;
     c->on_connected_ref = on_connected;
-    c->on_read_ref = on_read;
-    c->on_disc_ref = on_disc;
+    c->on_read_ref      = on_read;
+    c->on_sendready_ref = on_sendready;
+    c->on_disc_ref      = on_disc;
     c->self_ref = LUA_NOREF;
     luaL_getmetatable(L, TCP_ASYNC_CONN_MT);
     lua_setmetatable(L, -2);
@@ -959,6 +1159,9 @@ static int l_async_close(lua_State *L) {
     tcp_async_conn_t *c = (tcp_async_conn_t *)luaL_checkudata(L, 1, TCP_ASYNC_CONN_MT);
     if (c->closed) return 0;
     c->closed = 1;
+    /* M17-2: disarm the connect timer BEFORE freeing the bev so its callback
+     * cannot fire against a torn-down conn. */
+    async_conn_disarm_connect_timer(c);
     if (c->bev) { bufferevent_free(c->bev); c->bev = NULL; }
     /* v1 contract: close() also fires ondisconnected(self, "closed") — makes
      * downstream state-machine cleanup uniform (one path for both peer-driven
@@ -972,6 +1175,10 @@ static int l_async_close(lua_State *L) {
 static int l_async_reconnect(lua_State *L) {
     tcp_async_conn_t *c = (tcp_async_conn_t *)luaL_checkudata(L, 1, TCP_ASYNC_CONN_MT);
     if (c->closed) { lua_pushnil(L); lua_pushstring(L, "closed"); return 2; }
+    /* M17-2: tear down any stale timer along with the bev so rebuild starts
+     * from a clean slate.  The timer would otherwise be reused with a fresh
+     * event_new inside rebuild_bev and we would leak the old one. */
+    async_conn_disarm_connect_timer(c);
     if (c->bev) { bufferevent_free(c->bev); c->bev = NULL; }
     c->connecting = 0;
     c->connected = 0;
@@ -1041,11 +1248,23 @@ static int l_async_shutdown(lua_State *L) {
 
 static int async_conn_gc(lua_State *L) {
     tcp_async_conn_t *c = (tcp_async_conn_t *)luaL_checkudata(L, 1, TCP_ASYNC_CONN_MT);
+    /* M17-2: disarm the connect timer first so it cannot fire against a
+     * conn whose registry refs are already unref'd. */
+    async_conn_disarm_connect_timer(c);
     if (c->bev) { bufferevent_free(c->bev); c->bev = NULL; }
-    if (c->host) { free(c->host); c->host = NULL; }
+    /* Free every strdup'd string. */
+    if (c->host)             { free(c->host);             c->host = NULL; }
+    if (c->ssl_host)         { free(c->ssl_host);         c->ssl_host = NULL; }
+    if (c->cainfo)           { free(c->cainfo);           c->cainfo = NULL; }
+    if (c->capath)           { free(c->capath);           c->capath = NULL; }
+    if (c->pkcs12_path)      { free(c->pkcs12_path);      c->pkcs12_path = NULL; }
+    if (c->pkcs12_password)  { free(c->pkcs12_password);  c->pkcs12_password = NULL; }
+    /* Release Lua registry refs (callbacks + optional evdns pin). */
     if (c->on_connected_ref != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_connected_ref); c->on_connected_ref = LUA_NOREF; }
-    if (c->on_read_ref != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_read_ref); c->on_read_ref = LUA_NOREF; }
-    if (c->on_disc_ref != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_disc_ref); c->on_disc_ref = LUA_NOREF; }
+    if (c->on_read_ref      != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_read_ref);      c->on_read_ref      = LUA_NOREF; }
+    if (c->on_sendready_ref != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_sendready_ref); c->on_sendready_ref = LUA_NOREF; }
+    if (c->on_disc_ref      != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_disc_ref);      c->on_disc_ref      = LUA_NOREF; }
+    if (c->evdns_ref        != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->evdns_ref);        c->evdns_ref        = LUA_NOREF; }
     /* self_ref should already be gone by the time __gc runs (it was the only
      * strong root that kept us alive); if it lingers, drop it. */
     if (c->self_ref != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->self_ref); c->self_ref = LUA_NOREF; }

@@ -33,6 +33,28 @@ struct bufferevent *fan_tls_client_bev(struct event_base *base,
                                        int verify_host,
                                        const char **err);
 
+/* M17-2: extended client builder — same as fan_tls_client_bev but with
+ * per-request TLS options (ssl_host / cainfo / capath / pkcs12).  The
+ * SSL_CTX is drawn from a process-wide fingerprint-keyed cache so two
+ * connections with identical TLS params share a single ctx (see the cache
+ * design comment above the implementation in tls.c).  Passing all option
+ * pointers as NULL is equivalent to fan_tls_client_bev.
+ *
+ * `ssl_host` overrides `host` for SNI and hostname verification when set
+ * to a non-empty string; NULL / "" falls back to `host`.
+ * `cainfo` / `capath` follow OpenSSL SSL_CTX_load_verify_locations semantics.
+ * `pkcs12_path` / `pkcs12_password` load a client-cert bundle. */
+struct bufferevent *fan_tls_client_bev_ex(struct event_base *base,
+                                          const char *host,
+                                          const char *ssl_host,
+                                          int verify_peer,
+                                          int verify_host,
+                                          const char *cainfo,
+                                          const char *capath,
+                                          const char *pkcs12_path,
+                                          const char *pkcs12_password,
+                                          const char **err);
+
 /* ---- server side --------------------------------------------------------- */
 
 /* Build a server SSL context from a PEM cert + key file pair. Returns an
