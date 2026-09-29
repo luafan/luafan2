@@ -27,6 +27,19 @@ not planning notes.
   are live objects with `:update()` / `:delete()` / `:remove()`
   methods; auto-diff persists only changed columns.
 
+## Networking
+- [fan.tcp / fan.tcpd](tcp.md) — M2 + M17 TCP client + server.  M17
+  adds a callback-based async API (`connect_async` / `bind_async`)
+  that restores the full v1 `fan.tcpd` contract: immediate handle
+  return, `onconnected` / `onread` / `onsendready` / `ondisconnected`
+  callbacks (exactly-once disc), pre-connect send queue, three
+  independent timeouts, full TLS parameter surface including PKCS#12
+  client certificates, custom evdns resolver, and server-side
+  `bind_async` with `onaccept(self, accept)` + `accept:bind{...}`
+  two-step configuration.  `require("fan.tcpd")` gives the async
+  entries as `.connect` / `.bind` for v1 code that used to depend on
+  a Luan-private `tcpd_compat.lua`.
+
 ## HTTP client
 - [fan.http](http.md) — M4 + M13.C + M16.4 HTTP/1.1 client shim over
   either the libcurl C backend or the pure-Lua backend.  Shared
