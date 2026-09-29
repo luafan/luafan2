@@ -85,13 +85,25 @@ local BASE = "http://127.0.0.1:" .. tostring(PORT)
 local popen = fan.popen
 assert(type(popen) == "table", "fan.popen required for webase integration")
 
--- LUA_PATH must include lua/ (for `require "fan.utils"` etc.) and the
--- webase directory (for `require "route"`, "webfile", ...). We ALSO
--- prepend the webase directory to search paths so require finds route
--- / webfile without qualifying names.
+-- LUA_PATH must include lua/ (for `require "fan.utils"` etc.), the
+-- webase directory (for `require "route"`, "webfile", ...), and the
+-- tests/lua/framework directory so a coverage-enabled child can
+-- `require "coverage"` (which pulls luacov.runner). The final ";;"
+-- appends the default Lua path so luacov itself (installed as a
+-- LuaRocks module in the CI image) still resolves.
 local LUA_PATH = string.format(
-  "%s/lua/?.lua;%s/lua/?/init.lua;%s/?.lua;;",
-  ROOT, ROOT, WEBASE_DIR)
+  "%s/lua/?.lua;%s/lua/?/init.lua;%s/?.lua;%s/tests/lua/framework/?.lua;;",
+  ROOT, ROOT, WEBASE_DIR, ROOT)
+
+-- Under `run_tests.sh --coverage` the parent shell exports
+-- LUAFAN_COVERAGE=1 and each Lua test is launched via
+-- `fan -e 'require "coverage"' test_xxx.lua` so luacov's runner is
+-- installed before the test's code runs. We inherit that mode into
+-- the webase child so lines executed in webase/*.lua by the running
+-- server are recorded — without it, the child sees LUAFAN_COVERAGE
+-- but doesn't preload the runner, and the whole webase tree is
+-- invisible to luacov.
+local COVERAGE = os.getenv("LUAFAN_COVERAGE") == "1"
 
 local child
 local function start_server()
@@ -110,23 +122,39 @@ local function start_server()
   -- config.d isn't in the fixture on purpose: the shipped defaults in
   -- webase/config.d/service.lua + core.lua already read SERVICE_PORT /
   -- WEBROOT env vars, so we override those via `env=` below.
+  local fan_cmd
+  if COVERAGE then
+    fan_cmd = string.format(
+      "cd %q && exec %q -e 'require \"coverage\"' %q/core.lua",
+      FIXTURES_DIR, FAN_BIN, WEBASE_DIR)
+  else
+    fan_cmd = string.format("cd %q && exec %q %q/core.lua",
+                            FIXTURES_DIR, FAN_BIN, WEBASE_DIR)
+  end
+  local child_env = {
+    LUA_PATH        = LUA_PATH,
+    SERVICE_HOST    = "127.0.0.1",
+    SERVICE_PORT    = tostring(PORT),
+    WEBROOT         = FIXTURES_DIR .. "/web",
+    SERVICE_WORKERS = "0",
+    PURGE_TOKEN     = "test_secret_token",
+    -- Copy through the CI harness's PATH so `execvp` inside the
+    -- shell resolves basic tools if the child spawns any.
+    PATH            = os.getenv("PATH") or "/usr/local/bin:/usr/bin:/bin",
+  }
+  if COVERAGE then
+    child_env.LUAFAN_COVERAGE = "1"
+    -- Absolute path to the project .luacov config. The child chdirs into
+    -- FIXTURES_DIR before exec, so luacov's default lookup can't find
+    -- .luacov in CWD; without this, the child would silently use luacov
+    -- defaults and write stats to FIXTURES_DIR/luacov.stats.out — never
+    -- merged into the run's aggregate. See framework/coverage.lua for the
+    -- statsfile absolute-path rewrite that goes with this env var.
+    child_env.LUAFAN_LUACOV_CONFIG = ROOT .. "/.luacov"
+  end
   child = assert(popen.spawn{
-    command = {
-      "/bin/sh", "-c",
-      string.format("cd %q && exec %q %q/core.lua",
-                    FIXTURES_DIR, FAN_BIN, WEBASE_DIR),
-    },
-    env = {
-      LUA_PATH        = LUA_PATH,
-      SERVICE_HOST    = "127.0.0.1",
-      SERVICE_PORT    = tostring(PORT),
-      WEBROOT         = FIXTURES_DIR .. "/web",
-      SERVICE_WORKERS = "0",
-      PURGE_TOKEN     = "test_secret_token",
-      -- Copy through the CI harness's PATH so `execvp` inside the
-      -- shell resolves basic tools if the child spawns any.
-      PATH            = os.getenv("PATH") or "/usr/local/bin:/usr/bin:/bin",
-    },
+    command = { "/bin/sh", "-c", fan_cmd },
+    env     = child_env,
   })
 end
 
@@ -148,8 +176,23 @@ local function child_output()
   return table.concat(child_log)
 end
 
+-- Forward-declared so stop_server can call it (tcp_request is defined
+-- below with the other HTTP helpers). Under LUAFAN_COVERAGE=1 we hit
+-- /__coverage_flush before killing the child so luacov's exit hook
+-- gets to run inside the still-alive process — SIGTERM/SIGKILL bypass
+-- __gc and no stats would be written otherwise.
+local tcp_request  -- forward-declare
+
 local function stop_server()
   if not child then return end
+  if COVERAGE and tcp_request then
+    -- Best-effort: swallow errors so a broken shutdown path doesn't
+    -- mask real test failures.
+    pcall(tcp_request, "GET", "/__coverage_flush")
+    -- Give the child a moment to flush + fan.loopbreak + lua_close
+    -- before we tear down the pipes.
+    fan.sleep(0.15)
+  end
   pcall(child.close, child)
   child = nil
 end
@@ -160,7 +203,8 @@ end
 -- libcurl which brings a whole layer we don't need for a small
 -- synchronous test client. The socket-level client also lets us pin
 -- exact request headers (If-None-Match, Accept-Encoding).
-local function tcp_request(method, path, extra_headers, body)
+-- Assigned to the forward-declared upvalue so stop_server can call it.
+tcp_request = function(method, path, extra_headers, body)
   extra_headers = extra_headers or {}
   local conn, cerr = fan.tcp.connect("127.0.0.1", PORT)
   if not conn then return nil, cerr end

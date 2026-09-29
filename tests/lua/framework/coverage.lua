@@ -32,7 +32,42 @@ if os.getenv("LUAFAN_COVERAGE") == "1" then
     return
   end
   local runner = runner_or_err
-  local cfg_ok, cfg_err = pcall(runner.init)
+  -- Child processes launched by tests (e.g. test_webase spawns a webase
+  -- server in a fixtures dir with chdir) don't have `.luacov` in CWD, so
+  -- luacov's default lookup would silently use defaults and write stats
+  -- to CWD/luacov.stats.out — invisible to the aggregator that only reads
+  -- /work/build-coverage/luacov.stats.out. LUAFAN_LUACOV_CONFIG points
+  -- luacov at the shared config file (absolute path); it takes an absolute
+  -- path to the config file and returns a config table `runner.init`
+  -- accepts. When unset, fall back to luacov's built-in .luacov search.
+  local cfg_path = os.getenv("LUAFAN_LUACOV_CONFIG")
+  local init_arg
+  if cfg_path and cfg_path ~= "" then
+    -- The config is a Lua chunk that `returns` a settings table; dofile
+    -- gives us the table directly, which runner.init accepts.
+    local dof_ok, dof = pcall(dofile, cfg_path)
+    if dof_ok and type(dof) == "table" then
+      init_arg = dof
+      -- .luacov's statsfile is written as a project-root-relative path
+      -- ("build-coverage/luacov.stats.out"). When a child test process
+      -- chdirs before exec (test_webase enters its fixtures directory
+      -- so webase can resolve handle/, service/, web/ relative to CWD),
+      -- luacov would write stats under CWD/build-coverage/, invisible
+      -- to the aggregator that only reads /work/build-coverage/. Rewrite
+      -- the relative statsfile to an absolute path anchored at the
+      -- config file's directory (which is always /work in-container).
+      if type(init_arg.statsfile) == "string"
+         and init_arg.statsfile:sub(1, 1) ~= "/" then
+        local cfg_dir = cfg_path:match("(.*)/[^/]+$") or "."
+        init_arg.statsfile = cfg_dir .. "/" .. init_arg.statsfile
+      end
+    else
+      io.stderr:write("[coverage] failed to load LUAFAN_LUACOV_CONFIG="
+                      .. tostring(cfg_path) .. ": "
+                      .. tostring(dof) .. "\n")
+    end
+  end
+  local cfg_ok, cfg_err = pcall(runner.init, init_arg)
   if not cfg_ok then
     io.stderr:write("[coverage] luacov init failed: "
                     .. tostring(cfg_err) .. "\n")

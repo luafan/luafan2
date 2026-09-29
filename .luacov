@@ -19,6 +19,7 @@ return {
     include = {
         "lua/fan/",
         "lua/fan$",           -- lua/fan.lua (if it exists in the future)
+        "webase/",            -- M12.2 webase application framework
     },
     exclude = {
         "/luacov",             -- luacov's own modules
