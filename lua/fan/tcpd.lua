@@ -35,9 +35,8 @@
 local fan = require("fan")
 
 return {
+    -- M17-1: callback-based client (v1 fan.tcpd.connect parity)
     connect = fan.tcp.connect_async,
-    -- bind_async lands in M17-3; until then require("fan.tcpd").bind exposes
-    -- the positional fan.tcp.bind for callers that only need the coroutine-
-    -- style listener.  M17-3 will swap this to tcp.bind_async.
-    bind    = fan.tcp.bind,
+    -- M17-3: callback-based server (v1 fan.tcpd.bind parity)
+    bind    = fan.tcp.bind_async,
 }

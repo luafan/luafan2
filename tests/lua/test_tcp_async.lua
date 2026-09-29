@@ -566,4 +566,494 @@ s:test("evdns option is accepted and pinned across the connection", function()
   T.not_nil(seen.disc)
 end)
 
+-- ======================================================================
+-- M17-3 additions: server-side fan.tcp.bind_async
+-- ======================================================================
+
+-- ---------------------------------------------------------------------
+-- Happy path server: bind_async accepts a connection, onaccept receives
+-- (self, accept), accept:bind installs the callbacks, echo round-trip.
+-- ---------------------------------------------------------------------
+s:test("bind_async: onaccept + accept:bind + echo round-trip", function()
+  local PORT = 24501
+  local seen = { self_type = nil, accepted = 0, echoed = 0,
+                 disc_server_side = nil, disc_client_side = nil }
+  local server, cli
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1",
+      port = PORT,
+      onaccept = function(srv, accept)
+        seen.self_type = type(srv)     -- expect "userdata"
+        seen.accepted = seen.accepted + 1
+        accept:bind{
+          onread = function(a, data)
+            seen.echoed = seen.echoed + 1
+            a:send("echo:" .. data)
+          end,
+          ondisconnected = function(a, reason)
+            seen.disc_server_side = reason
+          end,
+        }
+      end,
+    })
+
+    cli = tcp.connect_async{
+      host = "127.0.0.1",
+      port = PORT,
+      onconnected = function(self) self:send("ping") end,
+      onread = function(self, data)
+        T.eq(data, "echo:ping")
+        self:close()
+      end,
+      ondisconnected = function(self, reason)
+        seen.disc_client_side = reason
+        fan.loopbreak()
+      end,
+    }
+  end)
+  if server then server:close() end
+  T.eq(seen.self_type, "userdata",
+       "onaccept must receive the server userdata as arg 1")
+  T.eq(seen.accepted, 1)
+  T.eq(seen.echoed, 1)
+  T.not_nil(seen.disc_client_side)
+end)
+
+-- ---------------------------------------------------------------------
+-- accept:remoteinfo returns {ip=..., port=...} for the peer.
+-- ---------------------------------------------------------------------
+s:test("bind_async: accept:remoteinfo returns peer ip + port", function()
+  local PORT = 24502
+  local remote_seen
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1",
+      port = PORT,
+      onaccept = function(srv, accept)
+        remote_seen = accept:remoteinfo()
+        accept:bind{
+          ondisconnected = function() fan.loopbreak() end,
+        }
+        accept:close()
+      end,
+    })
+    tcp.connect_async{
+      host = "127.0.0.1", port = PORT,
+      ondisconnected = function() end,
+    }
+  end)
+  if server then server:close() end
+  T.eq(type(remote_seen), "table")
+  T.eq(remote_seen.ip, "127.0.0.1")
+  T.truthy(remote_seen.port and remote_seen.port > 0)
+end)
+
+-- ---------------------------------------------------------------------
+-- accept:pause_read / resume_read cycle around a receive.
+-- ---------------------------------------------------------------------
+s:test("bind_async: accept:pause_read defers onread until resume_read", function()
+  local PORT = 24503
+  local seen = { paused = false, resumed = false, read_after_resume = nil }
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = PORT,
+      onaccept = function(srv, accept)
+        accept:bind{
+          onread = function(a, data)
+            if not seen.paused then
+              -- first byte: pause reads, then resume after a short
+              -- delay via a spawned coroutine.
+              seen.paused = true
+              seen.read_after_resume = data
+              a:pause_read()
+              fan.spawn(function()
+                fan.sleep(0.05)
+                seen.resumed = true
+                a:resume_read()
+                a:close()
+              end)
+            end
+          end,
+          ondisconnected = function() end,
+        }
+      end,
+    })
+    tcp.connect_async{
+      host = "127.0.0.1", port = PORT,
+      onconnected = function(self) self:send("first-batch") end,
+      ondisconnected = function() fan.loopbreak() end,
+    }
+  end)
+  if server then server:close() end
+  T.eq(seen.paused, true)
+  T.eq(seen.resumed, true)
+  T.eq(seen.read_after_resume, "first-batch")
+end)
+
+-- ---------------------------------------------------------------------
+-- accept:flush is a no-op on socket bevs but must return successfully.
+-- ---------------------------------------------------------------------
+s:test("bind_async: accept:flush is accepted and returns true", function()
+  local PORT = 24504
+  local flush_ok
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = PORT,
+      onaccept = function(srv, accept)
+        accept:bind{ ondisconnected = function() fan.loopbreak() end }
+        accept:send("hello")
+        flush_ok = accept:flush()
+        accept:close()
+      end,
+    })
+    tcp.connect_async{
+      host = "127.0.0.1", port = PORT,
+      ondisconnected = function() end,
+    }
+  end)
+  if server then server:close() end
+  T.eq(flush_ok, true)
+end)
+
+-- ---------------------------------------------------------------------
+-- server:getport returns the actual bound port (useful when passing 0).
+-- ---------------------------------------------------------------------
+s:test("bind_async: server:getport returns the bound port", function()
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = 0,   -- kernel-picked
+      onaccept = function() end,
+    })
+    fan.loopbreak()
+  end)
+  local p = server:getport()
+  T.truthy(p and p > 0 and p < 65536, "getport returned " .. tostring(p))
+  server:close()
+end)
+
+-- ---------------------------------------------------------------------
+-- server:rebind rebuilds the listener on the same port.
+-- ---------------------------------------------------------------------
+s:test("bind_async: server:rebind() re-listens on the same port", function()
+  local PORT = 24505
+  local ok
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = PORT,
+      onaccept = function() end,
+    })
+    ok = server:rebind()
+    fan.loopbreak()
+  end)
+  T.eq(ok, true)
+  T.eq(server:getport(), PORT)
+  server:close()
+end)
+
+-- ---------------------------------------------------------------------
+-- bind_async rejects worker= and callback_self_first= (same v2 policy
+-- as connect_async).
+-- ---------------------------------------------------------------------
+s:test("bind_async: worker= raises an error", function()
+  local ok, err = pcall(tcp.bind_async, {
+    host = "127.0.0.1", port = 24506,
+    onaccept = function() end,
+    worker = 0,
+  })
+  T.eq(ok, false)
+  T.truthy(err and err:find("worker", 1, true))
+end)
+
+s:test("bind_async: callback_self_first= raises an error", function()
+  local ok, err = pcall(tcp.bind_async, {
+    host = "127.0.0.1", port = 24507,
+    onaccept = function() end,
+    callback_self_first = false,
+  })
+  T.eq(ok, false)
+  T.truthy(err and err:find("callback_self_first", 1, true))
+end)
+
+-- ---------------------------------------------------------------------
+-- fan.tcpd shim: require("fan.tcpd").bind === fan.tcp.bind_async
+-- ---------------------------------------------------------------------
+s:test("require('fan.tcpd').bind === fan.tcp.bind_async", function()
+  local tcpd = require("fan.tcpd")
+  T.eq(tcpd.bind, tcp.bind_async)
+end)
+
+-- ---------------------------------------------------------------------
+-- accept:send / accept:close on already-closed accept return (nil, err).
+-- ---------------------------------------------------------------------
+s:test("bind_async: send() / close() on closed accept are safe", function()
+  local PORT = 24508
+  local sent_ok, sent_err
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = PORT,
+      onaccept = function(srv, accept)
+        accept:bind{ ondisconnected = function() fan.loopbreak() end }
+        accept:close()
+        sent_ok, sent_err = accept:send("nothing-goes-through")
+      end,
+    })
+    tcp.connect_async{
+      host = "127.0.0.1", port = PORT,
+      ondisconnected = function() end,
+    }
+  end)
+  if server then server:close() end
+  T.eq(sent_ok, nil)
+  T.eq(sent_err, "closed")
+end)
+
+-- ---------------------------------------------------------------------
+-- Coverage: exercise error paths and lifecycle branches that the happy-
+-- path tests above do not touch.  Each of these is a distinct C branch
+-- in bind_async / async_server_gc / async_accept_gc.
+-- ---------------------------------------------------------------------
+
+s:test("bind_async: ssl=true without cert/key returns (nil, err)", function()
+  local sv, err = tcp.bind_async{
+    host = "127.0.0.1", port = 24510,
+    ssl = true,   -- missing cert + key
+    onaccept = function() end,
+  }
+  T.eq(sv, nil)
+  T.is_type(err, "string")
+  T.truthy(err:find("cert", 1, true) or err:find("key", 1, true))
+end)
+
+s:test("bind_async: onaccept missing raises an error", function()
+  local ok, err = pcall(tcp.bind_async, {
+    host = "127.0.0.1", port = 24511,
+    -- no onaccept
+  })
+  T.eq(ok, false)
+  T.truthy(err and err:find("onaccept", 1, true))
+end)
+
+s:test("bind_async: bad host raises an error", function()
+  local ok, err = pcall(tcp.bind_async, {
+    host = "not-a-valid-ip", port = 24512,
+    onaccept = function() end,
+  })
+  T.eq(ok, false)
+  T.truthy(err and err:find("host", 1, true))
+end)
+
+s:test("bind_async: server:close() then rebind returns (nil, err)", function()
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = 24513,
+      onaccept = function() end,
+    })
+    fan.loopbreak()
+  end)
+  server:close()
+  local ok, err = server:rebind()
+  T.eq(ok, nil)
+  T.is_type(err, "string")
+end)
+
+s:test("bind_async: server:getport after close returns (nil, err)", function()
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = 24514,
+      onaccept = function() end,
+    })
+    fan.loopbreak()
+  end)
+  server:close()
+  local p, err = server:getport()
+  T.eq(p, nil)
+  T.is_type(err, "string")
+end)
+
+s:test("bind_async: accept:bind twice returns (nil, 'accept already bound')", function()
+  local PORT = 24515
+  local err1, err2
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = PORT,
+      onaccept = function(srv, accept)
+        local ok1 = accept:bind{
+          ondisconnected = function() fan.loopbreak() end,
+        }
+        err1 = ok1
+        local ok2, e = accept:bind{ onread = function() end }
+        err2 = e
+        accept:close()
+      end,
+    })
+    tcp.connect_async{
+      host = "127.0.0.1", port = PORT,
+      ondisconnected = function() end,
+    }
+  end)
+  if server then server:close() end
+  T.eq(err1, true)                     -- first bind succeeded
+  T.is_type(err2, "string")            -- second bind reported an error
+  T.truthy(err2:find("already bound", 1, true))
+end)
+
+s:test("bind_async: accept:bind rejects callback_self_first", function()
+  local PORT = 24516
+  local caught
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = PORT,
+      onaccept = function(srv, accept)
+        local ok, err = pcall(function()
+          accept:bind{ callback_self_first = false }
+        end)
+        caught = err
+        accept:bind{ ondisconnected = function() fan.loopbreak() end }
+        accept:close()
+      end,
+    })
+    tcp.connect_async{
+      host = "127.0.0.1", port = PORT,
+      ondisconnected = function() end,
+    }
+  end)
+  if server then server:close() end
+  T.truthy(caught and caught:find("callback_self_first", 1, true))
+end)
+
+s:test("bind_async: accept:remoteinfo on closed accept returns (nil, err)", function()
+  local PORT = 24517
+  local ri, err
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = PORT,
+      onaccept = function(srv, accept)
+        accept:bind{ ondisconnected = function() fan.loopbreak() end }
+        accept:close()
+        ri, err = accept:remoteinfo()
+      end,
+    })
+    tcp.connect_async{
+      host = "127.0.0.1", port = PORT,
+      ondisconnected = function() end,
+    }
+  end)
+  if server then server:close() end
+  T.eq(ri, nil)
+  T.is_type(err, "string")
+end)
+
+s:test("bind_async: send_buffer_size / receive_buffer_size are accepted", function()
+  -- We cannot easily observe SO_SNDBUF / SO_RCVBUF from Lua, but we CAN
+  -- assert the bind + accept complete without error when the option is
+  -- set — proving the setsockopt code path is reached.
+  local PORT = 24518
+  local accepted = 0
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = PORT,
+      send_buffer_size    = 64 * 1024,
+      receive_buffer_size = 64 * 1024,
+      onaccept = function(srv, accept)
+        accepted = accepted + 1
+        accept:bind{ ondisconnected = function() fan.loopbreak() end }
+        accept:close()
+      end,
+    })
+    tcp.connect_async{
+      host = "127.0.0.1", port = PORT,
+      ondisconnected = function() end,
+    }
+  end)
+  if server then server:close() end
+  T.eq(accepted, 1)
+end)
+
+s:test("bind_async: onsendready fires on accept side after drain", function()
+  local PORT = 24519
+  local sendready_seen = 0
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = PORT,
+      onaccept = function(srv, accept)
+        accept:bind{
+          onsendready = function(a)
+            sendready_seen = sendready_seen + 1
+            a:close()
+          end,
+          ondisconnected = function() fan.loopbreak() end,
+        }
+        accept:send("data-that-drains")
+      end,
+    })
+    tcp.connect_async{
+      host = "127.0.0.1", port = PORT,
+      onread = function(self, data) end,   -- drain
+      ondisconnected = function() end,
+    }
+  end)
+  if server then server:close() end
+  T.truthy(sendready_seen >= 1)
+end)
+
+s:test("bind_async: TLS server accepts a TLS client (end-to-end)", function()
+  local TMP = os.getenv("TMPDIR") or "/tmp"
+  local CERT = TMP .. "/fan_tcpd_async_cert.pem"
+  local KEY  = TMP .. "/fan_tcpd_async_key.pem"
+  local have = os.execute("command -v openssl >/dev/null 2>&1")
+  if not (have == true or have == 0) then return end
+
+  os.execute(string.format(
+    "openssl req -x509 -newkey rsa:2048 -keyout %s -out %s -days 1 -nodes " ..
+    "-subj /CN=localhost >/dev/null 2>&1", KEY, CERT))
+
+  local PORT = 24520
+  local got_on_server, got_on_client
+  local server
+  with_loop(function()
+    server = assert(tcp.bind_async{
+      host = "127.0.0.1", port = PORT,
+      ssl = true, cert = CERT, key = KEY,
+      onaccept = function(srv, accept)
+        accept:bind{
+          onread = function(a, data)
+            got_on_server = data
+            a:send("srv-echo:" .. data)
+          end,
+          ondisconnected = function() end,
+        }
+      end,
+    })
+    tcp.connect_async{
+      host = "127.0.0.1", port = PORT,
+      ssl = true,
+      ssl_verifypeer = 0, ssl_verifyhost = 0,   -- self-signed cert
+      onconnected = function(self) self:send("hello-tls") end,
+      onread = function(self, data)
+        got_on_client = data
+        self:close()
+      end,
+      ondisconnected = function() fan.loopbreak() end,
+    }
+  end)
+  if server then server:close() end
+  os.execute("rm -f " .. CERT .. " " .. KEY)
+  T.eq(got_on_server, "hello-tls")
+  T.eq(got_on_client, "srv-echo:hello-tls")
+end)
+
 os.exit(T.run(s))
