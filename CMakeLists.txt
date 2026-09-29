@@ -256,18 +256,82 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND FAN2_LINK_LIBS util)
 endif()
 
-# ---- the `fan` executable (self-contained: embeds Lua, statically links v2) ----
+# ---------------------------------------------------------------------------
+# Dual-form delivery (M15):
+#   1) build/fan.so   — Lua-loadable shared module (all v2 C code + heavy deps
+#                       libcurl/libssl/libevent/... live here).  When a host
+#                       Lua interpreter does `require("fan")` it dlopen()s this
+#                       file with RTLD_LOCAL, so libcurl et al. stay scoped to
+#                       fan.so's namespace and do not pollute the host.
+#   2) build/fan      — thin executable that only owns main.c (signal, VM
+#                       lifecycle, argv parsing) and links fan.so like any
+#                       other consumer.  Its DT_NEEDED list ends up being
+#                       essentially { liblua, libfan.so, libc } — no direct
+#                       libcurl / libssl / libevent dependency.
+#
+# Rationale for the split: v1 fan.so achieved dependency isolation for free
+# because Lua's package loader dlopen()s .so with RTLD_LOCAL.  v2 (up to M14)
+# delivered only the executable form, which meant the process DT_NEEDED every
+# dep globally.  Restoring the fan.so form (without giving up the executable)
+# brings back that isolation while keeping v2's ownership of lua_State
+# lifecycle in main.c.  See docs / manifest/fan-so-module.md.
+# ---------------------------------------------------------------------------
 if(NOT LUA_LIBRARY)
     message(FATAL_ERROR "liblua not found — the `fan` executable must link the Lua VM")
 endif()
-add_executable(fan src/main.c ${FAN2_LIB_SOURCES})
+
+# ---- fan.so: Lua-loadable shared module carrying all v2 C code ----
+add_library(fan_module MODULE ${FAN2_LIB_SOURCES})
+target_include_directories(fan_module PRIVATE ${FAN2_INCLUDES})
+target_compile_definitions(fan_module PRIVATE ${FAN2_DEFS})
+# Note on liblua: when fan.so is loaded by a host Lua interpreter via
+# `require("fan")` its lua_* symbols come from the host's own libLua (either
+# statically linked into the interpreter or already dlopen()ed with
+# RTLD_GLOBAL by the interpreter).  When fan.so is loaded by our own thin
+# `fan` executable, the executable itself links liblua and its lua_*
+# symbols are visible to fan.so through RTLD_GLOBAL scope (the executable's
+# dynamic symbol table).  We still link liblua into fan.so directly so
+# every symbol resolves at build time (macOS `ld` requires it; Linux `ld`
+# is lenient but the extra NEEDED entry costs nothing and matches what v1
+# fan.so shipped as well).
+target_link_libraries(fan_module PRIVATE ${FAN2_LINK_LIBS} ${LUA_LIBRARY})
+# Lua's require("fan") looks for `fan.so` (not `libfan.so`).  On macOS a
+# MODULE library defaults to `.so` too (CMake makes it a bundle, not a
+# dylib), so the same rule works everywhere we currently build.
+set_target_properties(fan_module PROPERTIES
+    OUTPUT_NAME "fan"
+    PREFIX ""
+    SUFFIX ".so"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+# ---- fan: thin executable, only owns main.c; dlopen()s fan.so at runtime ----
+#
+# The executable does NOT link fan_module (which is a MODULE library — CMake
+# forbids link-time dependencies on plugins, and RTLD_LOCAL isolation only
+# works via runtime dlopen anyway).  main.c uses dlopen("fan.so", RTLD_LOCAL)
+# + dlsym() to resolve `luaopen_fan`, `fan_clear_lua_states`, and
+# `fan_loop_cleanup` at startup.  This is exactly the v1 loading model:
+# libcurl / libssl / libevent land in fan.so's DT_NEEDED, but because
+# RTLD_LOCAL keeps them scoped to fan.so's own namespace they don't leak
+# into the executable's global symbol namespace.
+#
+# Resulting DT_NEEDED for `fan` on Linux: liblua + libdl + libc.  Everything
+# else (curl/ssl/event/z/sqlite3/mariadb) is transitively pulled in through
+# fan.so at dlopen time, not through the executable.
+add_executable(fan src/main.c)
 target_include_directories(fan PRIVATE ${FAN2_INCLUDES})
 target_compile_definitions(fan PRIVATE ${FAN2_DEFS})
-target_link_libraries(fan ${LUA_LIBRARY} ${FAN2_LINK_LIBS})
-# export symbols so Lua `require` of a C module could resolve, and for tracebacks
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_options(fan PRIVATE -rdynamic)
-endif()
+# CMAKE_DL_LIBS = "dl" on Linux (empty on macOS — libdl is in libSystem).
+# We deliberately do NOT link fan_module here; see comment block above.
+target_link_libraries(fan PRIVATE ${LUA_LIBRARY} ${CMAKE_DL_LIBS})
+# fan_module (fan.so) must be built before `fan` runs, but there is no
+# link dependency — express the build ordering explicitly.
+add_dependencies(fan fan_module)
+# NOTE: -rdynamic was previously needed so that a Lua C module dlopen()ed
+# from the host could resolve symbols back into the executable.  Now that
+# fan.so owns luaopen_fan and every other public symbol itself, and stack
+# traces come from -g debug info rather than dynsym, -rdynamic is not
+# required — dropping it keeps the executable's dynamic symbol table small.
 set_target_properties(fan PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 # ---- C unit test runner ----

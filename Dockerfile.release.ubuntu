@@ -66,7 +66,7 @@ RUN cmake -S /src -B /src/build \
         -DFAN_WITH_SQLITE3=ON \
         -DFAN_WITH_MARIADB=ON \
     && cmake --build /src/build -j"$(nproc)" --target fan \
-    && strip /src/build/fan
+    && strip /src/build/fan /src/build/fan.so
 
 # Fail early if the produced binary is missing anything obvious. `ldd`
 # on the RELEASE image would be too late — the builder image still has
@@ -103,11 +103,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# `fan` binary → /usr/local/bin (already on PATH). Lua modules →
-# /usr/local/share/lua/5.3/ so the built-in Lua package.path finds
-# `require "fan.compat"`, `require "config"`, etc. without any
-# LUA_PATH env-var plumbing on the caller's side.
+# `fan` binary → /usr/local/bin (already on PATH).
+#
+# M15 dual-form delivery: `fan` is now a thin executable that dlopen()s
+# `fan.so` (from the same directory as the running binary — see
+# src/main.c's resolve_self_path + load_fan_so).  Both files MUST land
+# side-by-side, or `fan -v` will die with
+#   `fan: cannot load /usr/local/bin/fan.so: cannot open shared object file`.
+# The Lua modules go under /usr/local/share/lua/5.3/ so Lua's default
+# package.path finds `require "fan.compat"`, `require "config"`, etc.
+# without any LUA_PATH env-var plumbing on the caller's side.
 COPY --from=builder /src/build/fan       /usr/local/bin/fan
+COPY --from=builder /src/build/fan.so    /usr/local/bin/fan.so
 COPY --from=builder /src/lua/            /usr/local/share/lua/5.3/
 
 # Smoke test: image must at least be able to load fan and every Lua

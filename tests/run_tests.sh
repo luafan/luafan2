@@ -131,6 +131,32 @@ case "$MODE" in
             if [ -n "$HUNG" ]; then
                 echo "!!! HUNG SUITES:$HUNG"
             fi
+
+            # ---- M15: cross-interpreter fan.so smoke test ----
+            # Verifies the second half of the dual-form delivery promise:
+            # build/fan.so can be dlopen()ed by ANY stock Lua interpreter
+            # via require("fan"), not just our own thin `fan` executable.
+            # If this ever regresses (e.g. someone reintroduces a symbol
+            # that only fan.c exports, or fan_module drops liblua from its
+            # link line and macOS-only builds keep working while Linux
+            # breaks), the failure is caught here rather than at deploy.
+            # The actual asserts live in tests/lua_smoke_fan_so.lua so we
+            # can keep the smoke code out of this shell heredoc entirely.
+            echo
+            echo "=== fan.so cross-interpreter smoke (stock lua5.3) ==="
+            if command -v lua5.3 >/dev/null 2>&1; then
+                LUA_CPATH="$BUILD/?.so;;" \
+                LUA_PATH="/work/lua/?.lua;/work/lua/?/init.lua;;" \
+                    lua5.3 /work/tests/lua_smoke_fan_so.lua
+                SMOKE_RC=$?
+                if [ $SMOKE_RC -ne 0 ]; then
+                    echo "!!! fan.so cross-interpreter smoke FAILED (rc=$SMOKE_RC)"
+                    LUA_RC=1
+                fi
+            else
+                echo "(skip: /usr/bin/lua5.3 not present in this image)"
+            fi
+
             exit $LUA_RC
         '
         ;;
