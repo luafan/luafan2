@@ -145,6 +145,22 @@ s:test("decode refuses trailing garbage", function()
   T.is_nil(ok); T.not_nil(err); T.truthy(err:find("trailing"))
 end)
 
+s:test("tostring(json.null) returns 'null', not 'table: 0x...'", function()
+  -- The __tostring metamethod on the null sentinel makes it play nice with
+  -- print(), string.format("%s", ...), string concat, log libraries, etc.
+  -- Without this, `log.info("field a =", body.a)` would emit noisy
+  -- "table: 0x7f..." for a JSON null field.  Downstream code depends on
+  -- this — do not remove the __tostring binding.
+  T.eq(tostring(json.null), "null")
+  T.eq(tostring(json.decode("null")), "null")            -- same sentinel
+  T.eq(string.format("%s", json.null), "null")
+  T.eq("[" .. tostring(json.null) .. "]", "[null]")
+  -- Sanity: it really is a table under the hood (not userdata)
+  T.eq(type(json.null), "table")
+  -- And decode always yields the exact same table instance
+  T.eq(json.null == json.decode("null"), true)
+end)
+
 s:test("json.null sentinel survives object round-trip", function()
   local o = json.object{ x = json.null, y = 1 }
   local enc = json.encode(o)
@@ -165,6 +181,51 @@ s:test("object key type check: non-string keys are rejected", function()
   local o = json.object()
   o[42] = "wrong"
   T.error_raised(function() json.encode(o) end)
+end)
+
+s:test("json.is_nonempty_string classifies strings", function()
+  -- true only for a Lua string with length > 0
+  T.eq(json.is_nonempty_string("hi"),    true)
+  T.eq(json.is_nonempty_string("a"),     true)
+  T.eq(json.is_nonempty_string(" "),     true)  -- whitespace still non-empty
+  T.eq(json.is_nonempty_string(""),      false)
+  T.eq(json.is_nonempty_string(nil),     false)
+  T.eq(json.is_nonempty_string(42),      false)
+  T.eq(json.is_nonempty_string(true),    false)
+  T.eq(json.is_nonempty_string({"x"}),   false)
+  T.eq(json.is_nonempty_string(json.null), false)
+  -- Zero args behaves like nil (LUA_TNONE at index 1)
+  T.eq(json.is_nonempty_string(),        false)
+end)
+
+s:test("json.is_present distinguishes nil / null-sentinel / real values", function()
+  -- Real values are present
+  T.eq(json.is_present("hi"),   true)
+  T.eq(json.is_present(""),     true)   -- empty string IS present (has type)
+  T.eq(json.is_present(0),      true)   -- zero IS present
+  T.eq(json.is_present(false),  true)   -- false IS present
+  T.eq(json.is_present({}),     true)   -- table IS present
+  T.eq(json.is_present({1,2}),  true)
+  -- nil and json.null are NOT present
+  T.eq(json.is_present(nil),       false)
+  T.eq(json.is_present(json.null), false)
+  T.eq(json.is_present(),          false)  -- no argument
+end)
+
+s:test("json.is_present + decode: null-sentinel survives, is_present picks it up", function()
+  local body = json.decode('{"a": null, "b": 42, "c": ""}')
+  -- b.a is the null sentinel, NOT Lua nil, so `body.a == nil` is FALSE:
+  T.eq(body.a == nil,               false)
+  T.eq(body.a,                      json.null)
+  -- The idiomatic "did the caller pass a real value here?" check:
+  T.eq(json.is_present(body.a),     false)   -- explicit null
+  T.eq(json.is_present(body.b),     true)    -- 42
+  T.eq(json.is_present(body.c),     true)    -- "" is present
+  T.eq(json.is_present(body.missing), false) -- absent key -> nil -> not present
+  -- Contrast with is_nonempty_string on the same body:
+  T.eq(json.is_nonempty_string(body.a), false)  -- null sentinel is a table, not string
+  T.eq(json.is_nonempty_string(body.c), false)  -- "" is empty
+  T.eq(json.is_nonempty_string(json.encode(body.b)), true)  -- "42" is non-empty
 end)
 
 os.exit(T.run(s))

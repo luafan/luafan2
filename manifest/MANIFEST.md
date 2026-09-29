@@ -27,6 +27,12 @@ not planning notes.
   are live objects with `:update()` / `:delete()` / `:remove()`
   methods; auto-diff persists only changed columns.
 
+## Codecs
+- [fan.json](json.md) — M9 + M16.3 native JSON codec.  RFC 8259
+  numbers/escapes/UTF-8, sentinel-based null, explicit array/object
+  markers.  M16.3 restored `is_nonempty_string` and `is_present`
+  presence predicates from v1.
+
 ## Test coverage
 - [Coverage — latest run](coverage-latest.md) — most recent
   C + Lua line coverage numbers with target thresholds.

@@ -700,6 +700,46 @@ static int l_is_object(lua_State *L) {
     return 1;
 }
 
+/* json.is_nonempty_string(v) -> boolean.
+ * True iff v is a Lua string with length > 0.  Convenience for the very
+ * common "did the caller pass a real, non-empty string field" check on
+ * decoded JSON bodies.  A missing key would surface as nil (type != string
+ * -> false); an empty string "" from `{"name":""}` also returns false. */
+static int l_is_nonempty_string(lua_State *L) {
+    if (lua_type(L, 1) != LUA_TSTRING) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    size_t len;
+    lua_tolstring(L, 1, &len);
+    lua_pushboolean(L, len > 0);
+    return 1;
+}
+
+/* json.is_present(v) -> boolean.
+ * True iff v is neither Lua nil nor the fan.json.null sentinel table.
+ *
+ * Because fan.json.decode ALWAYS represents JSON null as the sentinel
+ * (fan.json has no `enable_null` toggle — that v1 knob is intentionally
+ * absent from v2), a plain `if body.field then ... end` check treats
+ * "user wrote null" and "user wrote 42" the same when the app cares.
+ * is_present distinguishes them:
+ *
+ *   body = json.decode('{"a": null, "b": 1}')
+ *   body.a  == nil                 -- false, it's the null sentinel
+ *   json.is_present(body.a)        -- false
+ *   json.is_present(body.b)        -- true
+ *   json.is_present(body.missing)  -- false (nil)
+ */
+static int l_is_present(lua_State *L) {
+    if (lua_isnoneornil(L, 1)) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    lua_pushboolean(L, !is_null(L, 1));
+    return 1;
+}
+
 /* null.__tostring => "null" */
 static int null_tostring(lua_State *L) {
     lua_pushliteral(L, "null");
@@ -735,6 +775,9 @@ void fan_json_register(lua_State *L) {
     lua_pushcfunction(L, l_object);    lua_setfield(L, -2, "object");
     lua_pushcfunction(L, l_is_array);  lua_setfield(L, -2, "is_array");
     lua_pushcfunction(L, l_is_object); lua_setfield(L, -2, "is_object");
+    lua_pushcfunction(L, l_is_nonempty_string);
+    lua_setfield(L, -2, "is_nonempty_string");
+    lua_pushcfunction(L, l_is_present); lua_setfield(L, -2, "is_present");
 
     lua_setfield(L, -2, "json");
 }
