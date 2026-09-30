@@ -213,8 +213,17 @@ static int l_sanitize_utf8(lua_State *L) {
 
 /* ---- runtime: loop / loopbreak / spawn ------------------------------------ */
 
+/* fan.spawn is declared below; fan.loop(callback, ...) uses the same
+ * coroutine pinning/resume path before entering the event loop. */
+static int l_spawn(lua_State *L);
+
 static int l_loop(lua_State *L) {
-    (void)L;
+    /* v1-compatible form: fan.loop(function(...) ... end, ...). The callback
+     * must start before dispatch so its first fan.sleep/socket operation can
+     * park a coroutine and let the event loop resume it. */
+    if (lua_gettop(L) > 0 && lua_isfunction(L, 1)) {
+        l_spawn(L);
+    }
     int rc = fan_loop_run();
     lua_pushinteger(L, rc);
     return 1;
