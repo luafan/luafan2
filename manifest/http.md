@@ -75,15 +75,37 @@ both call.
 303 (and 301/302 with a non-GET request) switch to GET and drop the
 request body on redirect — same as v1 and the pure-Lua backend.
 
+## Streaming callbacks (M20)
+
+Both backends accept optional `onheader` and `onreceive` callbacks
+plus a `buffered` toggle.  See
+[M20 HTTP streaming callbacks](m20-http-streaming.md) for the full
+contract, but the summary is:
+
+* `onheader(response)` runs once when the status line + headers are
+  fully parsed, before any body byte is delivered.
+* `onreceive(chunk)` runs for each decoded body slice; chunked
+  framing is not exposed.
+* `buffered = true` (default even when `onreceive` is set) keeps
+  `response.body` as the complete aggregate.  `buffered = false`
+  skips accumulation for streaming-only consumers (SSE / large
+  downloads / long-poll).
+* Returning `false` (or raising) from either callback cancels the
+  in-flight request and produces `nil, err`.
+
 ## Tests
 
 * `tests/lua/test_http.lua` — Lua backend end-to-end (pinned via
   `__FAN_HTTP_BACKEND_DEFAULT = "lua"`); covers verb-form dispatch,
-  chunked reader, redirect loop, `responseCode` alias, and the M16.4
-  `set_default_follow_redirects` knob.
+  chunked reader, redirect loop, `responseCode` alias, the M16.4
+  `set_default_follow_redirects` knob, and the M20 streaming
+  callbacks (onheader / onreceive / buffered=false / cancellation).
 * `tests/lua/test_http_c.lua` — C backend focused suite; covers the
-  same response contract (including `responseCode`) plus TLS + libcurl
-  specifics.
+  same response contract (including `responseCode`), TLS + libcurl
+  specifics, and the M20 streaming callbacks on the libcurl
+  bridge (onheader once, onreceive with buffered aggregate,
+  buffered=false, cancellation via `false` / raised error, callback
+  type validation).
 
 Both suites run in-process against a `fan.tcp.bind` origin server
 built at the top of the file.

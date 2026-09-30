@@ -170,6 +170,32 @@ typedef struct req_ctx {
     int             co_ref;           /* pins the coroutine across the yield */
     int             done;             /* set by info-drain, checked by wake */
     int             curl_result;      /* CURLcode from info-read */
+    /* M20.2: v1-era streaming callbacks. Both are optional. When
+     * `onreceive_ref` is set, cb_write invokes it for each libcurl-delivered
+     * chunk (already decoded — chunked-transfer framing is stripped by
+     * libcurl before WRITEFUNCTION sees it). When `onheader_ref` is set,
+     * cb_header invokes it exactly once at the header/body boundary with
+     * a {status, responseCode, reason, headers} table.
+     *
+     * `buffered` (default 1) controls whether the response body is still
+     * accumulated in resp_body for the final `response.body` field.
+     * Callers that want memory-cap streaming for large bodies pass
+     * buffered=false to skip evbuffer_add and get `response.body = ""`.
+     *
+     * `header_dispatched` is a one-shot latch so cb_header can call
+     * onheader exactly once even though libcurl invokes it per header
+     * line (including the trailing empty CRLF terminator we key off of).
+     *
+     * `cancel_err` is set when a callback returns false or raises; we
+     * return 0 from the curl callback to make libcurl abort the transfer
+     * with CURLE_WRITE_ERROR, then check_multi_info surfaces the message
+     * verbatim rather than curl's generic "Failed writing received data
+     * to disk/application" string. */
+    int             onreceive_ref;    /* LUA_NOREF when unset */
+    int             onheader_ref;     /* LUA_NOREF when unset */
+    int             buffered;         /* 0 -> don't accumulate resp_body */
+    int             header_dispatched;
+    char           *cancel_err;       /* strdup'd; freed at completion */
 } req_ctx_t;
 
 /* Per-socket state we hand to libevent. libcurl gives us a socket + a
@@ -189,6 +215,10 @@ static int    cb_socket(CURL *easy, curl_socket_t s, int what, void *up, void *s
 static int    cb_timer(CURLM *m, long timeout_ms, void *up);
 static size_t cb_write(char *ptr, size_t size, size_t nmemb, void *up);
 static size_t cb_header(char *ptr, size_t size, size_t nmemb, void *up);
+/* M20.2 header-parse helpers (defined after check_multi_info, forward-decl'd
+ * here so check_multi_info's completion tail can call them). */
+static void push_reason(lua_State *L, const char *hbuf, size_t hlen);
+static void push_headers_table(lua_State *L, const char *hbuf, size_t hlen);
 
 /* ---- lazy init ---------------------------------------------------------- */
 static int ensure_multi(lua_State *L) {
@@ -330,110 +360,38 @@ static void check_multi_info(void) {
              * resp.responseCode keeps working without an adapter layer. */
             lua_pushinteger(co, code);
             lua_setfield(co, -2, "responseCode");
-            /* reason: libcurl doesn't expose it directly; parse from the
-             * saved status line "HTTP/1.1 200 OK\r\n". First line of
-             * r->resp_headers before the first "\r\n". */
+
+            /* Reason phrase + lower-cased headers table, both parsed from
+             * the raw wire buffer r->resp_headers. Extracted to M20.2
+             * helpers so cb_header can dispatch onheader with the same
+             * shape at header/body boundary. */
             size_t hlen = evbuffer_get_length(r->resp_headers);
             const char *hbuf = hlen ? (const char *)evbuffer_pullup(r->resp_headers, -1) : "";
-            const char *reason = "";
-            if (hlen) {
-                const char *eol = memchr(hbuf, '\r', hlen);
-                size_t line_len = eol ? (size_t)(eol - hbuf) : hlen;
-                /* find first space, then second space */
-                const char *p = memchr(hbuf, ' ', line_len);
-                if (p) {
-                    p++;
-                    const char *p2 = memchr(p, ' ', hbuf + line_len - p);
-                    if (p2) {
-                        p2++;
-                        lua_pushlstring(co, p2, hbuf + line_len - p2);
-                        lua_setfield(co, -2, "reason");
-                    } else {
-                        lua_pushstring(co, "");
-                        lua_setfield(co, -2, "reason");
-                    }
-                } else {
-                    lua_pushstring(co, "");
-                    lua_setfield(co, -2, "reason");
-                }
-                (void)reason;
-            } else {
-                lua_pushstring(co, "");
-                lua_setfield(co, -2, "reason");
-            }
-
-            /* headers table (lowercased keys, comma-fold duplicates). Parse
-             * from the raw wire buffer. Every response block starts with a
-             * status line; skip it. Terminates at "\r\n\r\n" (which we've
-             * observed once per response block; if the peer sent
-             * intermediate 1xx headers libcurl already stripped them from
-             * the FINAL block that HEADERFUNCTION delivers for the
-             * top-level transfer). */
-            lua_newtable(co);
-            {
-                const char *cur = hbuf;
-                const char *end = hbuf + hlen;
-                /* skip status line */
-                while (cur < end && *cur != '\n') cur++;
-                if (cur < end) cur++;
-                while (cur < end) {
-                    /* find CRLF */
-                    const char *eol = memchr(cur, '\n', end - cur);
-                    if (!eol) break;
-                    size_t linelen = eol - cur;
-                    /* strip trailing \r */
-                    if (linelen && cur[linelen - 1] == '\r') linelen--;
-                    if (linelen == 0) break;   /* end of header block */
-                    /* split at first ':' */
-                    const char *colon = memchr(cur, ':', linelen);
-                    if (colon) {
-                        size_t keylen = colon - cur;
-                        const char *val = colon + 1;
-                        size_t vlen = linelen - keylen - 1;
-                        /* trim leading spaces on value */
-                        while (vlen && (*val == ' ' || *val == '\t')) { val++; vlen--; }
-                        /* lowercase the key onto a stack buffer (headers
-                         * are always ASCII; capped at 512 to stay simple) */
-                        char kbuf[512];
-                        size_t kn = keylen < sizeof(kbuf) ? keylen : sizeof(kbuf);
-                        for (size_t i = 0; i < kn; i++) {
-                            char c = cur[i];
-                            if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
-                            kbuf[i] = c;
-                        }
-                        lua_pushlstring(co, kbuf, kn);          /* key */
-                        /* fold if existing */
-                        lua_pushlstring(co, kbuf, kn);
-                        lua_gettable(co, -3);
-                        if (lua_isstring(co, -1)) {
-                            size_t oldlen; const char *old = lua_tolstring(co, -1, &oldlen);
-                            luaL_Buffer bb;
-                            luaL_buffinit(co, &bb);
-                            luaL_addlstring(&bb, old, oldlen);
-                            luaL_addlstring(&bb, ", ", 2);
-                            luaL_addlstring(&bb, val, vlen);
-                            luaL_pushresult(&bb);
-                            lua_remove(co, -2);                 /* drop old */
-                        } else {
-                            lua_pop(co, 1);
-                            lua_pushlstring(co, val, vlen);
-                        }
-                        lua_settable(co, -3);
-                    }
-                    cur = eol + 1;
-                }
-            }
+            push_reason(co, hbuf, hlen);
+            lua_setfield(co, -2, "reason");
+            push_headers_table(co, hbuf, hlen);
             lua_setfield(co, -2, "headers");
 
-            /* body */
+            /* body — empty in streaming mode (buffered=false) since cb_write
+             * skipped accumulation. */
             size_t blen = evbuffer_get_length(r->resp_body);
             const char *bbuf = blen ? (const char *)evbuffer_pullup(r->resp_body, -1) : "";
             lua_pushlstring(co, bbuf, blen);
             lua_setfield(co, -2, "body");
         } else {
-            /* Failed transfer: return nil, err. */
+            /* Failed transfer: return nil, err. If a user callback aborted
+             * the transfer (onreceive / onheader returned false or raised),
+             * surface the callback's message instead of libcurl's generic
+             * CURLE_WRITE_ERROR text. */
             lua_pushnil(co);
-            const char *msg = r->errbuf[0] ? r->errbuf : curl_easy_strerror(r->curl_result);
+            const char *msg;
+            if (r->cancel_err) {
+                msg = r->cancel_err;
+            } else if (r->errbuf[0]) {
+                msg = r->errbuf;
+            } else {
+                msg = curl_easy_strerror(r->curl_result);
+            }
             lua_pushstring(co, msg ? msg : "curl error");
         }
 
@@ -456,6 +414,19 @@ static void check_multi_info(void) {
         if (r->req_headers) { curl_slist_free_all(r->req_headers); r->req_headers = NULL; }
         if (r->body_copy)   { free(r->body_copy); r->body_copy = NULL; }
         r->body_len = 0;
+        /* M20.2: release the callback refs held via luaL_ref. Safe to do
+         * before wake because the callbacks have already fired for this
+         * request; no future WRITEFUNCTION / HEADERFUNCTION will run on
+         * this easy handle after multi_remove above. */
+        if (r->onreceive_ref != LUA_NOREF) {
+            luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onreceive_ref);
+            r->onreceive_ref = LUA_NOREF;
+        }
+        if (r->onheader_ref != LUA_NOREF) {
+            luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onheader_ref);
+            r->onheader_ref = LUA_NOREF;
+        }
+        if (r->cancel_err) { free(r->cancel_err); r->cancel_err = NULL; }
         CURL_EASY_CLEANUP(easy, "multi_info_done");
         r->easy = NULL;
         /* evbuffers can stay — l_req_gc frees them when the userdata dies,
@@ -477,11 +448,125 @@ static void check_multi_info(void) {
     }
 }
 
+/* ---- M20.2: header-parse helpers shared by cb_header (early dispatch) and
+ * check_multi_info (final response table). Both operate on the raw wire
+ * buffer `r->resp_headers` accumulated by cb_header line-by-line.
+ * ------------------------------------------------------------------------- */
+
+/* Push a Lua string with the HTTP reason phrase parsed from the status line
+ * "HTTP/1.1 CODE REASON\r\n". Pushes "" on any parse failure so callers can
+ * always `lua_setfield(L, -2, "reason")` unconditionally. */
+static void push_reason(lua_State *L, const char *hbuf, size_t hlen) {
+    if (!hlen) { lua_pushstring(L, ""); return; }
+    const char *eol = memchr(hbuf, '\r', hlen);
+    size_t line_len = eol ? (size_t)(eol - hbuf) : hlen;
+    const char *p = memchr(hbuf, ' ', line_len);
+    if (!p) { lua_pushstring(L, ""); return; }
+    p++;
+    const char *p2 = memchr(p, ' ', hbuf + line_len - p);
+    if (!p2) { lua_pushstring(L, ""); return; }
+    p2++;
+    lua_pushlstring(L, p2, hbuf + line_len - p2);
+}
+
+/* Push a Lua table containing lower-cased response headers parsed from the
+ * raw wire buffer. Duplicates are comma-folded (matches the pure-Lua
+ * backend). The status line is skipped. Terminates at the empty CRLF line
+ * that libcurl always emits between the header block and the body. */
+static void push_headers_table(lua_State *L, const char *hbuf, size_t hlen) {
+    lua_newtable(L);
+    const char *cur = hbuf;
+    const char *end = hbuf + hlen;
+    /* skip status line */
+    while (cur < end && *cur != '\n') cur++;
+    if (cur < end) cur++;
+    while (cur < end) {
+        const char *eol = memchr(cur, '\n', end - cur);
+        if (!eol) break;
+        size_t linelen = eol - cur;
+        if (linelen && cur[linelen - 1] == '\r') linelen--;
+        if (linelen == 0) break;   /* end of header block */
+        const char *colon = memchr(cur, ':', linelen);
+        if (colon) {
+            size_t keylen = colon - cur;
+            const char *val = colon + 1;
+            size_t vlen = linelen - keylen - 1;
+            while (vlen && (*val == ' ' || *val == '\t')) { val++; vlen--; }
+            char kbuf[512];
+            size_t kn = keylen < sizeof(kbuf) ? keylen : sizeof(kbuf);
+            for (size_t i = 0; i < kn; i++) {
+                char c = cur[i];
+                if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
+                kbuf[i] = c;
+            }
+            lua_pushlstring(L, kbuf, kn);          /* key */
+            /* fold if existing */
+            lua_pushlstring(L, kbuf, kn);
+            lua_gettable(L, -3);
+            if (lua_isstring(L, -1)) {
+                size_t oldlen; const char *old = lua_tolstring(L, -1, &oldlen);
+                luaL_Buffer bb;
+                luaL_buffinit(L, &bb);
+                luaL_addlstring(&bb, old, oldlen);
+                luaL_addlstring(&bb, ", ", 2);
+                luaL_addlstring(&bb, val, vlen);
+                luaL_pushresult(&bb);
+                lua_remove(L, -2);                 /* drop old */
+            } else {
+                lua_pop(L, 1);
+                lua_pushlstring(L, val, vlen);
+            }
+            lua_settable(L, -3);
+        }
+        cur = eol + 1;
+    }
+}
+
+/* Common tail: record a callback cancellation so check_multi_info surfaces
+ * the exact message the user's callback triggered. Only the first cancel
+ * wins (subsequent aborts are curl's own reaction). */
+static void record_cancel(req_ctx_t *r, const char *msg) {
+    if (r->cancel_err || !msg) return;
+    r->cancel_err = strdup(msg);
+}
+
 /* ---- easy-handle write/header callbacks --------------------------------- */
 static size_t cb_write(char *ptr, size_t size, size_t nmemb, void *up) {
     req_ctx_t *r = (req_ctx_t *)up;
     size_t n = size * nmemb;
-    if (r->resp_body) evbuffer_add(r->resp_body, ptr, n);
+    /* Buffered mode (default): keep accumulating so response.body is a
+     * complete string at completion. Streaming mode (buffered=false):
+     * skip the copy so large bodies do not sit in memory. Both modes
+     * still dispatch to onreceive when it is set. */
+    if (r->buffered && r->resp_body) evbuffer_add(r->resp_body, ptr, n);
+    if (r->onreceive_ref == LUA_NOREF) return n;
+    if (r->cancel_err) return 0;  /* already aborting */
+
+    /* Dispatch onreceive(chunk). Pcall on the main state so a raising
+     * callback does not propagate through libcurl / the event loop.
+     * Returning false or raising records cancel_err and returns 0 so
+     * curl aborts with CURLE_WRITE_ERROR; check_multi_info then
+     * surfaces cancel_err verbatim. */
+    if (!g_main_L) return n;   /* teardown window: silently drop */
+    lua_rawgeti(g_main_L, LUA_REGISTRYINDEX, r->onreceive_ref);
+    lua_pushlstring(g_main_L, ptr, n);
+    int status = lua_pcall(g_main_L, 1, 1, 0);
+    if (status != LUA_OK) {
+        const char *msg = lua_tostring(g_main_L, -1);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "onreceive callback error: %s",
+                 msg ? msg : "(non-string error)");
+        record_cancel(r, buf);
+        lua_pop(g_main_L, 1);
+        return 0;
+    }
+    /* Cancel iff the callback returned exactly the boolean false. */
+    int cancel = (lua_type(g_main_L, -1) == LUA_TBOOLEAN && !lua_toboolean(g_main_L, -1));
+    lua_pop(g_main_L, 1);
+    if (cancel) {
+        record_cancel(r, "onreceive callback canceled");
+        return 0;
+    }
     return n;
 }
 
@@ -489,6 +574,58 @@ static size_t cb_header(char *ptr, size_t size, size_t nmemb, void *up) {
     req_ctx_t *r = (req_ctx_t *)up;
     size_t n = size * nmemb;
     if (r->resp_headers) evbuffer_add(r->resp_headers, ptr, n);
+
+    /* Detect the header/body boundary: libcurl invokes HEADERFUNCTION with
+     * an "\r\n" (or bare "\n") line after the final response header of a
+     * given block. On that line — and only once per request, guarded by
+     * header_dispatched — dispatch onheader if configured.
+     *
+     * Note: intermediate 1xx responses have their own header block that
+     * ends with the same empty-line marker; libcurl calls HEADERFUNCTION
+     * for both. We fire onheader on the FIRST such marker only. The
+     * common case (no 1xx) sees the correct final block; the 1xx case
+     * would fire early with the 100-Continue table. Live with that for
+     * now — v1 had the same behaviour and no caller depends on 1xx
+     * inspection. */
+    int is_terminator = (n == 2 && ptr[0] == '\r' && ptr[1] == '\n')
+                     || (n == 1 && ptr[0] == '\n');
+    if (!is_terminator) return n;
+    if (r->header_dispatched) return n;
+    r->header_dispatched = 1;
+    if (r->onheader_ref == LUA_NOREF) return n;
+    if (r->cancel_err) return 0;
+    if (!g_main_L) return n;   /* teardown window: silently drop */
+
+    /* Build {status, responseCode, reason, headers} from the raw wire
+     * buffer we just finished accumulating. */
+    long code = 0;
+    curl_easy_getinfo(r->easy, CURLINFO_RESPONSE_CODE, &code);
+    size_t hlen = evbuffer_get_length(r->resp_headers);
+    const char *hbuf = hlen ? (const char *)evbuffer_pullup(r->resp_headers, -1) : "";
+
+    lua_rawgeti(g_main_L, LUA_REGISTRYINDEX, r->onheader_ref);
+    lua_newtable(g_main_L);
+    lua_pushinteger(g_main_L, code);       lua_setfield(g_main_L, -2, "status");
+    lua_pushinteger(g_main_L, code);       lua_setfield(g_main_L, -2, "responseCode");
+    push_reason(g_main_L, hbuf, hlen);     lua_setfield(g_main_L, -2, "reason");
+    push_headers_table(g_main_L, hbuf, hlen); lua_setfield(g_main_L, -2, "headers");
+
+    int status = lua_pcall(g_main_L, 1, 1, 0);
+    if (status != LUA_OK) {
+        const char *msg = lua_tostring(g_main_L, -1);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "onheader callback error: %s",
+                 msg ? msg : "(non-string error)");
+        record_cancel(r, buf);
+        lua_pop(g_main_L, 1);
+        return 0;
+    }
+    int cancel = (lua_type(g_main_L, -1) == LUA_TBOOLEAN && !lua_toboolean(g_main_L, -1));
+    lua_pop(g_main_L, 1);
+    if (cancel) {
+        record_cancel(r, "onheader callback canceled");
+        return 0;
+    }
     return n;
 }
 
@@ -507,6 +644,17 @@ static int l_req_gc(lua_State *L) {
     if (r->body_copy)   { free(r->body_copy); r->body_copy = NULL; }
     if (r->resp_body)   { evbuffer_free(r->resp_body);   r->resp_body = NULL; }
     if (r->resp_headers){ evbuffer_free(r->resp_headers);r->resp_headers = NULL; }
+    /* M20.2: release callback refs if the request never made it to the
+     * completion path (rare — l_req_gc mostly fires as a safety net). */
+    if (r->onreceive_ref != LUA_NOREF && g_main_L) {
+        luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onreceive_ref);
+        r->onreceive_ref = LUA_NOREF;
+    }
+    if (r->onheader_ref != LUA_NOREF && g_main_L) {
+        luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onheader_ref);
+        r->onheader_ref = LUA_NOREF;
+    }
+    if (r->cancel_err) { free(r->cancel_err); r->cancel_err = NULL; }
     return 0;
 }
 
@@ -561,6 +709,10 @@ static int l_request(lua_State *L) {
     req_ctx_t *r = (req_ctx_t *)lua_newuserdata(L, sizeof(*r));
     memset(r, 0, sizeof(*r));
     r->co_ref = LUA_NOREF;
+    /* M20.2: default callback refs / streaming flags. */
+    r->onreceive_ref = LUA_NOREF;
+    r->onheader_ref  = LUA_NOREF;
+    r->buffered      = 1;             /* accumulate response.body by default */
     r->resp_body    = evbuffer_new();
     r->resp_headers = evbuffer_new();
     if (!r->resp_body || !r->resp_headers) {
@@ -681,6 +833,46 @@ static int l_request(lua_State *L) {
     lua_pop(L, 1);
     lua_getfield(L, 1, "capath");
     if (lua_isstring(L, -1)) curl_easy_setopt(r->easy, CURLOPT_CAPATH, lua_tostring(L, -1));
+    lua_pop(L, 1);
+
+    /* ---- M20.2: streaming callbacks + buffered flag --------------------
+     * onreceive(chunk) — fires from cb_write for each libcurl-delivered
+     *   body segment.
+     * onheader(info)  — fires once from cb_header at the header/body
+     *   boundary with {status, responseCode, reason, headers}.
+     * buffered (default true) — false skips response.body accumulation
+     *   for memory-cap streaming of large downloads.
+     *
+     * Refs are unref'd in check_multi_info's completion tail (or
+     * l_req_gc if the request never completed). Non-function values
+     * are rejected loudly rather than silently ignored. */
+    lua_getfield(L, 1, "onreceive");
+    if (lua_isfunction(L, -1)) {
+        r->onreceive_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    } else if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+    } else {
+        lua_pop(L, 1);
+        CURL_EASY_CLEANUP(r->easy, "l_request_bad_onreceive"); r->easy = NULL;
+        return luaL_error(L, "onreceive must be a function");
+    }
+    lua_getfield(L, 1, "onheader");
+    if (lua_isfunction(L, -1)) {
+        r->onheader_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    } else if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+    } else {
+        lua_pop(L, 1);
+        /* If we already luaL_ref'd onreceive, unref it before erroring. */
+        if (r->onreceive_ref != LUA_NOREF) {
+            luaL_unref(L, LUA_REGISTRYINDEX, r->onreceive_ref);
+            r->onreceive_ref = LUA_NOREF;
+        }
+        CURL_EASY_CLEANUP(r->easy, "l_request_bad_onheader"); r->easy = NULL;
+        return luaL_error(L, "onheader must be a function");
+    }
+    lua_getfield(L, 1, "buffered");
+    if (lua_isboolean(L, -1)) r->buffered = lua_toboolean(L, -1);
     lua_pop(L, 1);
 
     /* Attach easy to the multi. We DON'T park the coroutine yet: if the

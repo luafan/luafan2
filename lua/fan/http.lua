@@ -132,6 +132,14 @@ local function c_do_once(opts)
   if opts.verify ~= nil       then c_opts.verify = opts.verify end
   if opts.verify_peer ~= nil  then c_opts.verify_peer = opts.verify_peer end
   if opts.verify_host ~= nil  then c_opts.verify_host = opts.verify_host end
+  -- M20.2: forward streaming callbacks + buffered flag to the C backend.
+  -- onreceive(chunk) fires from libcurl's WRITEFUNCTION for each decoded
+  -- body segment; onheader(info) fires once from HEADERFUNCTION at the
+  -- header/body boundary. buffered=false makes response.body come back
+  -- empty so large streams don't sit in memory.
+  if opts.onreceive ~= nil    then c_opts.onreceive = opts.onreceive end
+  if opts.onheader ~= nil     then c_opts.onheader  = opts.onheader end
+  if opts.buffered ~= nil     then c_opts.buffered  = opts.buffered end
   -- Module-scoped defaults for cookiejar / cainfo / capath — allow the
   -- per-call opts to override.
   c_opts.cookiejar = opts.cookiejar or M._cookiejar

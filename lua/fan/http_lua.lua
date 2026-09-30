@@ -313,6 +313,11 @@ local function do_once(opts)
     end
   end
   reader.onreceive = opts.onreceive
+  -- M20.2: streaming mode (buffered=false) drops response body accumulation.
+  -- Callers get the segments via onreceive; response.body is "". Default
+  -- (buffered nil/true) preserves the M20.1 double-output contract.
+  local buffered = opts.buffered
+  if buffered == nil then buffered = true end
 
   -- body framing
   local resp_body = ""
@@ -323,17 +328,18 @@ local function do_once(opts)
     if te:find("chunked", 1, true) then
       local b, berr = read_chunked(reader)
       if not b then conn:close(); return nil, berr end
-      resp_body = b
+      if buffered then resp_body = b end
     elseif headers["content-length"] then
       local n = tonumber(headers["content-length"])
       if n and n > 0 then
         local b, berr = reader:read_n(n)
         if not b then conn:close(); return nil, berr end
-        resp_body = b
+        if buffered then resp_body = b end
       end
     else
       -- read until EOF (Connection: close semantics)
-      resp_body = reader:read_until_eof()
+      local b = reader:read_until_eof()
+      if buffered then resp_body = b end
     end
   end
 

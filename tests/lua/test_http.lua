@@ -594,4 +594,28 @@ s:test("M20.1: callback exception and onheader cancellation are errors", functio
   T.truthy(err:find("onheader callback canceled", 1, true))
 end)
 
+s:test("M20.2: Lua backend buffered=false leaves response.body empty", function()
+  local PORT = 24437
+  local server, resp, pieces
+  run(function()
+    server = assert(fan.tcp.bind("127.0.0.1", PORT, function(conn)
+      local req = read_request(conn)
+      conn:send(resp_chunked(200, "OK", { "big-", "payload" }))
+      fan.sleep(0.03)
+      conn:close()
+    end))
+    pieces = {}
+    resp = http.request({
+      backend  = "lua",
+      url      = BASE .. PORT .. "/nobuf",
+      buffered = false,
+      onreceive = function(chunk) pieces[#pieces + 1] = chunk end,
+    })
+  end)
+  if server then server:close() end
+  T.not_nil(resp)
+  T.eq(resp.body, "", "buffered=false must leave body empty")
+  T.eq(table.concat(pieces), "big-payload")
+end)
+
 os.exit(T.run(s))

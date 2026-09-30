@@ -395,6 +395,194 @@ s:test("verb helpers respect explicit backend=c", function()
   T.not_nil(r_post); T.eq(r_post.status, 200); T.eq(r_post.body, "POST:/p")
 end)
 
+-- ---------------------------------------------------------------------------
+-- M20.2: streaming callbacks on the C/curl backend.
+--
+-- Origin uses fan.httpd_lua chunked replies so libcurl actually decodes
+-- transfer-encoding and delivers each chunk to WRITEFUNCTION. The tests
+-- assert:
+--   * onheader fires exactly once with a v1-shaped {status,responseCode,
+--     reason,headers} table containing the lower-cased headers, BEFORE
+--     onreceive.
+--   * onreceive fires at least once per chunk and never with header
+--     bytes (only decoded body).
+--   * response.body is still fully aggregated by default (buffered=true).
+--   * buffered=false skips aggregation while still delivering callbacks.
+--   * onreceive returning false / raising / onheader returning false /
+--     raising all abort with an explicit, dedicated error message; the
+--     transfer fails cleanly with response.body absent.
+--   * Non-function onreceive/onheader values are rejected up-front.
+-- ---------------------------------------------------------------------------
+
+s:test("M20.2: C onheader fires once, onreceive streams while buffering", function()
+  local PORT = 25520
+  local server, resp, headers_seen, header_info, chunk_count, agg
+  run(function()
+    server = assert(httpd_lua.bind{
+      port = PORT,
+      onService = function(req, r)
+        r:reply_start(200, { ["Content-Type"] = "text/plain",
+                             ["X-Streaming"] = "yes" })
+        r:reply_chunk("alpha-")
+        r:reply_chunk("beta-")
+        r:reply_chunk("gamma")
+        r:reply_end()
+      end,
+    })
+    headers_seen = 0
+    chunk_count  = 0
+    agg = {}
+    resp = http.request{
+      backend  = "c",
+      url      = BASE .. PORT .. "/stream",
+      onheader = function(info)
+        headers_seen = headers_seen + 1
+        header_info  = info
+      end,
+      onreceive = function(chunk)
+        chunk_count = chunk_count + 1
+        agg[#agg + 1] = chunk
+      end,
+    }
+  end)
+  if server then server:close() end
+  T.not_nil(resp)
+  T.eq(resp.status, 200)
+  -- onheader
+  T.eq(headers_seen, 1, "onheader fired more than once")
+  T.eq(header_info.status, 200)
+  T.eq(header_info.responseCode, 200)
+  T.eq(header_info.reason, "OK")
+  T.eq(header_info.headers["content-type"], "text/plain")
+  T.eq(header_info.headers["x-streaming"], "yes")
+  -- onreceive: at least one callback, and the concatenation matches body.
+  T.truthy(chunk_count >= 1, "onreceive never fired")
+  T.eq(table.concat(agg), "alpha-beta-gamma",
+    "onreceive aggregate mismatch")
+  -- Buffered by default: response.body is still the full body.
+  T.eq(resp.body, "alpha-beta-gamma")
+end)
+
+s:test("M20.2: buffered=false skips response.body accumulation", function()
+  local PORT = 25521
+  local server, resp, chunks
+  run(function()
+    server = assert(httpd_lua.bind{
+      port = PORT,
+      onService = function(req, r)
+        r:reply_start(200, { ["Content-Type"] = "text/plain" })
+        r:reply_chunk("large-")
+        r:reply_chunk("payload")
+        r:reply_end()
+      end,
+    })
+    chunks = {}
+    resp = http.request{
+      backend   = "c",
+      url       = BASE .. PORT .. "/",
+      buffered  = false,
+      onreceive = function(chunk) chunks[#chunks + 1] = chunk end,
+    }
+  end)
+  if server then server:close() end
+  T.not_nil(resp)
+  T.eq(resp.status, 200)
+  T.eq(resp.body, "", "buffered=false must leave response.body empty")
+  T.eq(table.concat(chunks), "large-payload",
+    "streaming aggregate mismatch")
+end)
+
+s:test("M20.2: onreceive returning false aborts with explicit error", function()
+  local PORT = 25522
+  local server, resp, err, calls
+  run(function()
+    server = assert(httpd_lua.bind{
+      port = PORT,
+      onService = function(req, r)
+        r:reply_start(200, { ["Content-Type"] = "text/plain" })
+        r:reply_chunk("first")
+        r:reply_chunk("second")
+        r:reply_end()
+      end,
+    })
+    calls = 0
+    resp, err = http.request{
+      backend   = "c",
+      url       = BASE .. PORT .. "/",
+      onreceive = function()
+        calls = calls + 1
+        return false
+      end,
+    }
+  end)
+  if server then server:close() end
+  T.is_nil(resp)
+  T.is_type(err, "string")
+  T.eq(calls, 1, "callback fired past cancellation")
+  T.truthy(err:find("onreceive callback canceled", 1, true),
+    "expected 'onreceive callback canceled', got: " .. tostring(err))
+end)
+
+s:test("M20.2: onreceive exception surfaces as callback error", function()
+  local PORT = 25523
+  local server, resp, err
+  run(function()
+    server = assert(httpd_lua.bind{
+      port = PORT,
+      onService = function(req, r)
+        r:reply(200, { ["Content-Type"] = "text/plain" }, "some-body")
+      end,
+    })
+    resp, err = http.request{
+      backend   = "c",
+      url       = BASE .. PORT .. "/",
+      onreceive = function() error("boom-c-stream") end,
+    }
+  end)
+  if server then server:close() end
+  T.is_nil(resp)
+  T.is_type(err, "string")
+  T.truthy(err:find("onreceive callback error", 1, true), err)
+  T.truthy(err:find("boom-c-stream", 1, true), err)
+end)
+
+s:test("M20.2: onheader returning false aborts the request", function()
+  local PORT = 25524
+  local server, resp, err, chunk_called
+  run(function()
+    server = assert(httpd_lua.bind{
+      port = PORT,
+      onService = function(req, r)
+        r:reply(200, { ["Content-Type"] = "text/plain" }, "body")
+      end,
+    })
+    chunk_called = false
+    resp, err = http.request{
+      backend   = "c",
+      url       = BASE .. PORT .. "/",
+      onheader  = function() return false end,
+      onreceive = function() chunk_called = true end,
+    }
+  end)
+  if server then server:close() end
+  T.is_nil(resp)
+  T.is_type(err, "string")
+  T.truthy(err:find("onheader callback canceled", 1, true),
+    "expected 'onheader callback canceled', got: " .. tostring(err))
+  T.falsy(chunk_called, "onreceive must not fire after onheader cancels")
+end)
+
+s:test("M20.2: non-function callback types are rejected up-front", function()
+  local ok_receive = pcall(function()
+    http.request{ backend = "c", url = BASE .. "1/", onreceive = 42 }
+  end)
+  T.falsy(ok_receive, "non-function onreceive must luaL_error")
+  local ok_header = pcall(function()
+    http.request{ backend = "c", url = BASE .. "1/", onheader = "not-fn" }
+  end)
+  T.falsy(ok_header, "non-function onheader must luaL_error")
+end)
+
 s:test("pick_backend selection rules", function()
   -- backend override wins
   T.eq(http._pick_backend{ backend = "lua" }, "lua")
