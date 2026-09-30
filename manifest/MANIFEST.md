@@ -37,8 +37,8 @@ not planning notes.
   and `make_dest` / `make_dests` for building destinations.
   `require("fan.udpd")` gives `.new` / `.make_dest` / `.make_dests` as
   v1 aliases.
-- [fan.tcp / fan.tcpd](tcp.md) — M2 + M17 TCP client + server.  M17
-  adds a callback-based async API (`connect_async` / `bind_async`)
+- [fan.tcp / fan.tcpd](tcp.md) — M2 + M17 + M21 TCP client + server.
+  M17 adds a callback-based async API (`connect_async` / `bind_async`)
   that restores the full v1 `fan.tcpd` contract: immediate handle
   return, `onconnected` / `onread` / `onsendready` / `ondisconnected`
   callbacks (exactly-once disc), pre-connect send queue, three
@@ -47,11 +47,15 @@ not planning notes.
   `bind_async` with `onaccept(self, accept)` + `accept:bind{...}`
   two-step configuration.  `require("fan.tcpd")` gives the async
   entries as `.connect` / `.bind` for v1 code that used to depend on
-  a Luan-private `tcpd_compat.lua`.
+  a Luan-private `tcpd_compat.lua`.  M21 extends `fan.tcp.connect`
+  with `ssl_host` / `cainfo` / `capath` opts (same surface as
+  `connect_async`) and replaces the opaque `"connection error"`
+  with specific DNS / TLS / socket-errno diagnostics.
 
 ## HTTP client
-- [fan.http](http.md) — M4 + M13.C + M16.4 + M20 HTTP/1.1 client shim over either the libcurl C backend or the pure-Lua backend. Shared response shape, both verb forms, redirect defaults, and `onheader` / decoded-body `onreceive` streaming callbacks on **both** backends with buffered / `buffered=false` modes.
+- [fan.http](http.md) — M4 + M13.C + M16.4 + M20 + M21 HTTP/1.1 client shim over either the libcurl C backend or the pure-Lua backend. Shared response shape, both verb forms, redirect defaults, `onheader` / decoded-body `onreceive` streaming callbacks on **both** backends with buffered / `buffered=false` modes, and per-request / module-scoped CA bundle pinning (`cainfo` / `capath`) on both backends.
 - [M20 HTTP streaming callbacks](m20-http-streaming.md) — `onheader`/`onreceive` on both Pure Lua and libcurl backends, buffered vs streaming-only modes, and callback cancellation/error semantics.
+- [M21 HTTPS CA pinning + TLS diagnostics](m21-tls-diagnostics.md) — pure-Lua HTTPS gains `cainfo` / `capath` per-request and module-scoped defaults; TLS / socket / DNS errors surface specific reasons (was opaque `"connection error"`); `SSL_CERT_FILE` / `SSL_CERT_DIR` env vars honoured for the process-wide default trust store.
 
 ## Codecs
 - [fan.json](json.md) — M9 + M16.3 native JSON codec.  RFC 8259

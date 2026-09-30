@@ -19,11 +19,80 @@
 #include <openssl/pkcs12.h>
 #include <event2/bufferevent_ssl.h>
 #include <stdio.h>
+#include <stdlib.h>             /* getenv */
 
 /* Process-wide client context. Created lazily, freed at process exit by the
  * OS; there is exactly one, so this is a bounded, intentional singleton (not a
  * per-connection leak — the v2 rule is "no unbounded static growth"). */
 static SSL_CTX *g_client_ctx = NULL;
+
+/* M21.1 — File-scope error buffer.  fan_tls_client_bev_ex writes its detailed
+ * OpenSSL error text here so callers get "certificate verify failed: unable
+ * to get local issuer certificate" instead of "SSL_CTX_load_verify_locations
+ * failed".  Single-threaded event loop → no locking; callers must copy /
+ * strdup before yielding if they want a stable string. */
+#define FAN_TLS_ERR_BUFLEN 256
+static char g_tls_err_buf[FAN_TLS_ERR_BUFLEN];
+
+/* Format the top OpenSSL error queue entry into out; clears the queue.
+ * Returns 1 if an error was popped, 0 if the queue was empty (out untouched).
+ * Uses ERR_peek_last_error so the *deepest* / most-specific reason is
+ * surfaced, then ERR_clear_error to drain the whole queue.  Both are
+ * async-signal safe and re-entrant. */
+static int fan_tls_pop_last_error(char *out, size_t outlen) {
+    unsigned long e = ERR_peek_last_error();
+    if (!e) return 0;
+    /* ERR_error_string_n needs 120+ bytes for the full "error:0xNNNNN:lib:
+     * fn:reason" form; we pass whatever the caller has and let it truncate. */
+    ERR_error_string_n(e, out, outlen);
+    ERR_clear_error();
+    return 1;
+}
+
+/* M21.1 — Public helper: fill `buf` with the OpenSSL peer-verify reason for
+ * `ssl`, e.g. "unable to get local issuer certificate".  Returns 1 on
+ * success (buf populated), 0 if the handshake either succeeded or has no
+ * verify result available.  Used by tcp.c to distinguish "CA verify failed"
+ * from other connect errors on the handshake path. */
+int fan_tls_client_verify_reason(void *ssl_ptr, char *buf, size_t buflen) {
+    SSL *ssl = (SSL *)ssl_ptr;
+    if (!ssl || !buf || buflen == 0) return 0;
+    long r = SSL_get_verify_result(ssl);
+    if (r == X509_V_OK) return 0;
+    const char *s = X509_verify_cert_error_string(r);
+    if (!s) s = "peer verify failed";
+    snprintf(buf, buflen, "%s", s);
+    return 1;
+}
+
+/* M21.1 — Load the system trust store into ctx.  Honors SSL_CERT_FILE /
+ * SSL_CERT_DIR env vars (openssl s_client convention: env takes priority
+ * over the compiled-in default), then falls back to
+ * SSL_CTX_set_default_verify_paths.  Failures are non-fatal — a ctx with no
+ * trust store still handshakes when verify_peer=false, and callers that
+ * verify will get a clear "unable to get local issuer certificate" from
+ * OpenSSL.  Return value is 1 if any trust source was successfully
+ * loaded, 0 otherwise. */
+static int fan_tls_load_system_trust(SSL_CTX *ctx) {
+    const char *env_file = getenv("SSL_CERT_FILE");
+    const char *env_dir  = getenv("SSL_CERT_DIR");
+    int ok = 0;
+    if ((env_file && env_file[0]) || (env_dir && env_dir[0])) {
+        if (SSL_CTX_load_verify_locations(ctx,
+                                          (env_file && env_file[0]) ? env_file : NULL,
+                                          (env_dir  && env_dir[0])  ? env_dir  : NULL) == 1) {
+            ok = 1;
+        }
+        /* If env-driven load failed we intentionally do NOT fall back to
+         * defaults — the user asked for a specific store and swapping it
+         * silently would hide bugs.  Leave ctx with no trust; verify will
+         * fail loudly.  fan_tls_init prints a stderr diagnostic below. */
+    }
+    if (!ok) {
+        if (SSL_CTX_set_default_verify_paths(ctx) == 1) ok = 1;
+    }
+    return ok;
+}
 
 void fan_tls_init(void) {
     if (g_client_ctx) return;
@@ -37,8 +106,24 @@ void fan_tls_init(void) {
     if (!ctx) return;
     /* Modern floor: TLS 1.2+. */
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    /* Load the system default trust store for peer verification. */
-    SSL_CTX_set_default_verify_paths(ctx);
+    /* Load the system default trust store for peer verification (or
+     * SSL_CERT_FILE / SSL_CERT_DIR when the caller has set them). */
+    if (!fan_tls_load_system_trust(ctx)) {
+        /* Non-fatal: log to stderr with the OpenSSL reason so operators
+         * can diagnose "no CA bundle available" on stripped-down images
+         * (e.g. alpine without ca-certificates).  Peer verification will
+         * still be attempted per-request and will fail with a clear
+         * verify-reason from fan_tls_client_verify_reason. */
+        char why[FAN_TLS_ERR_BUFLEN];
+        if (!fan_tls_pop_last_error(why, sizeof why)) {
+            snprintf(why, sizeof why, "no trust source loaded");
+        }
+        fprintf(stderr,
+                "[luafan2/tls] warning: system trust store not loaded (%s); "
+                "peer verification will fail unless a per-request cainfo/"
+                "capath is supplied\n",
+                why);
+    }
     g_client_ctx = ctx;
 }
 
@@ -197,17 +282,47 @@ static SSL_CTX *fan_tls_new_client_ctx(const char *cainfo, const char *capath,
 
     if (cainfo || capath) {
         if (SSL_CTX_load_verify_locations(ctx, cainfo, capath) != 1) {
-            if (err) *err = "SSL_CTX_load_verify_locations failed";
+            /* M21.1 — surface the underlying OpenSSL reason (e.g.
+             * "system lib" when the file is missing, or "no certificate or
+             * crl found" when the PEM is empty).  Preserving "SSL_CTX_
+             * load_verify_locations failed" as a prefix lets grep still
+             * find the callsite, while the appended details tell operators
+             * WHY it failed. */
+            char why[FAN_TLS_ERR_BUFLEN];
+            if (fan_tls_pop_last_error(why, sizeof why)) {
+                snprintf(g_tls_err_buf, sizeof g_tls_err_buf,
+                         "SSL_CTX_load_verify_locations(%s%s%s): %s",
+                         cainfo ? cainfo : "",
+                         (cainfo && capath) ? ", " : "",
+                         capath ? capath : "",
+                         why);
+            } else {
+                snprintf(g_tls_err_buf, sizeof g_tls_err_buf,
+                         "SSL_CTX_load_verify_locations(%s%s%s) failed",
+                         cainfo ? cainfo : "",
+                         (cainfo && capath) ? ", " : "",
+                         capath ? capath : "");
+            }
+            if (err) *err = g_tls_err_buf;
             SSL_CTX_free(ctx);
             return NULL;
         }
     } else {
-        SSL_CTX_set_default_verify_paths(ctx);
+        /* M21.1 — honor SSL_CERT_FILE / SSL_CERT_DIR when the caller
+         * didn't pin a bundle. */
+        (void)fan_tls_load_system_trust(ctx);
     }
 
     if (pkcs12_path) {
         if (fan_tls_load_pkcs12(ctx, pkcs12_path, pkcs12_password) != 0) {
-            if (err) *err = "PKCS12 load / parse failed";
+            char why[FAN_TLS_ERR_BUFLEN];
+            if (fan_tls_pop_last_error(why, sizeof why)) {
+                snprintf(g_tls_err_buf, sizeof g_tls_err_buf,
+                         "PKCS12 load(%s): %s", pkcs12_path, why);
+                if (err) *err = g_tls_err_buf;
+            } else {
+                if (err) *err = "PKCS12 load / parse failed";
+            }
             SSL_CTX_free(ctx);
             return NULL;
         }
@@ -377,6 +492,10 @@ struct bufferevent *fan_tls_client_bev_ex(struct event_base *base,
     (void)cainfo; (void)capath; (void)pkcs12_path; (void)pkcs12_password;
     if (err) *err = "TLS not compiled in (build with -DFAN_WITH_OPENSSL=ON)";
     return NULL;
+}
+int fan_tls_client_verify_reason(void *ssl_ptr, char *buf, size_t buflen) {
+    (void)ssl_ptr; (void)buf; (void)buflen;
+    return 0;
 }
 void *fan_tls_server_ctx_new(const char *cert_path, const char *key_path,
                              const char **err) {

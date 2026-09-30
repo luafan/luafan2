@@ -1,4 +1,4 @@
-# fan.http — client shim (M4 + M13.C + M16.4)
+# fan.http — client shim (M4 + M13.C + M16.4 + M20 + M21)
 
 `require("fan.http")` returns the HTTP/1.1 client shim used by both
 webase applications and standalone tools.  It exposes verb helpers
@@ -93,6 +93,20 @@ contract, but the summary is:
 * Returning `false` (or raising) from either callback cancels the
   in-flight request and produces `nil, err`.
 
+## CA bundle pinning + TLS diagnostics (M21)
+
+Both backends accept `cainfo` (PEM bundle path) and `capath`
+(hashed CA directory) per-request.  When absent, the shim falls
+back to `require("fan.http").cainfo(path)` / `.capath(path)` /
+the `M._cainfo` / `M._capath` module-scoped setters (v1-compatible
+API surface).  When those are absent, the process-wide trust store
+is used — either from `SSL_CERT_FILE` / `SSL_CERT_DIR` env vars
+or from `SSL_CTX_set_default_verify_paths`.
+
+TLS / DNS / socket failures now surface specific reasons instead
+of the opaque pre-M21 `"connection error"`.  Full contract in
+[M21 HTTPS CA pinning + TLS diagnostics](m21-tls-diagnostics.md).
+
 ## Tests
 
 * `tests/lua/test_http.lua` — Lua backend end-to-end (pinned via
@@ -106,6 +120,11 @@ contract, but the summary is:
   bridge (onheader once, onreceive with buffered aggregate,
   buffered=false, cancellation via `false` / raised error, callback
   type validation).
+* `tests/lua/test_http_tls.lua` (M21) — pure-Lua HTTPS + CA
+  pinning contract: correct-CA success, wrong-CA specific verify
+  error, missing-file CTX diagnostic, `verify=false` bypass,
+  `M.cainfo(path)` module setter, per-request override, closed
+  port socket errno, bad DNS surface — 9 cases.
 
 Both suites run in-process against a `fan.tcp.bind` origin server
 built at the top of the file.

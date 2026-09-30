@@ -20,9 +20,20 @@
 #include <event2/buffer.h>
 #include <event2/dns.h>
 #include <event2/listener.h>
+#include <event2/util.h>              /* EVUTIL_SOCKET_ERROR, evutil_socket_error_to_string */
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+
+/* M21.2 — pull in OpenSSL + libevent-openssl symbols so conn_eventcb can
+ * surface the *specific* handshake / socket reason instead of the generic
+ * "connection error".  Guarded by FAN_WITH_OPENSSL: builds without OpenSSL
+ * fall back to socket-errno only. */
+#if FAN_WITH_OPENSSL
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <event2/bufferevent_ssl.h>
+#endif
 
 #define TCP_CONN_MT "fan.tcp.conn"
 #define TCP_SERVER_MT "fan.tcp.server"
@@ -135,8 +146,76 @@ static void conn_readcb(struct bufferevent *bev, void *arg) {
     conn_try_complete_receive(c);
 }
 
+/* M21.2 — Build a specific error string for a bufferevent that just fired
+ * BEV_EVENT_ERROR.  Priority order (most-specific first):
+ *
+ *   1. DNS error via bufferevent_socket_get_dns_error(bev)  (non-zero when
+ *      the hostname lookup failed — evutil_gai_strerror gives "nodename nor
+ *      servname provided" / "Name or service not known" / etc.)
+ *   2. OpenSSL error queue via bufferevent_get_openssl_error(bev)  (non-zero
+ *      when the TLS bev is in the CONNECTING state and the handshake failed
+ *      — includes "certificate verify failed" / "wrong version number" / etc)
+ *   3. For TLS bevs whose OpenSSL queue is empty but the peer-verify result
+ *      is not X509_V_OK: X509_verify_cert_error_string  ("unable to get local
+ *      issuer certificate" etc).  This catches the "SSL_VERIFY_NONE would
+ *      have succeeded" case where the queue is drained but the result is
+ *      still bad.
+ *   4. Fall back to EVUTIL_SOCKET_ERROR() → evutil_socket_error_to_string
+ *      ("Connection refused", "Network is unreachable", ...).
+ *   5. Absolute fallback: "connection error" (only when nothing was
+ *      actionable — shouldn't happen in practice).
+ *
+ * The buffer is caller-owned; the returned string is `buf` on success or
+ * a static literal.  Never returns NULL. */
+static const char *conn_describe_bev_error(struct bufferevent *bev,
+                                           char *buf, size_t buflen) {
+    if (!bev || !buf || buflen == 0) return "connection error";
+    /* 1. DNS */
+    int dns_err = bufferevent_socket_get_dns_error(bev);
+    if (dns_err) {
+        snprintf(buf, buflen, "dns error: %s", evutil_gai_strerror(dns_err));
+        return buf;
+    }
+#if FAN_WITH_OPENSSL
+    /* 2. OpenSSL queue.  bufferevent_get_openssl_error only makes sense
+     *    when the bev is an openssl bev; on a plain socket bev it returns 0
+     *    (per libevent docs), so this is safe to always call. */
+    unsigned long ssl_err = bufferevent_get_openssl_error(bev);
+    if (ssl_err) {
+        char ssl_buf[192];
+        ERR_error_string_n(ssl_err, ssl_buf, sizeof ssl_buf);
+        /* ERR_clear_error() so the next request doesn't inherit stale
+         * queue entries — the queue is per-thread and we've now consumed
+         * the meaningful bits. */
+        ERR_clear_error();
+        snprintf(buf, buflen, "tls error: %s", ssl_buf);
+        return buf;
+    }
+    /* 3. Peer-verify reason for TLS bevs (queue was empty but verify
+     *    failed — happens with SSL_VERIFY_NONE + a bad cert, or when
+     *    OpenSSL cleared the queue between error and callback). */
+    SSL *ssl = bufferevent_openssl_get_ssl(bev);
+    if (ssl) {
+        char why[192];
+        if (fan_tls_client_verify_reason(ssl, why, sizeof why)) {
+            snprintf(buf, buflen, "tls verify failed: %s", why);
+            return buf;
+        }
+    }
+#endif
+    /* 4. Socket errno. */
+    int se = EVUTIL_SOCKET_ERROR();
+    if (se) {
+        snprintf(buf, buflen, "socket error: %s",
+                 evutil_socket_error_to_string(se));
+        return buf;
+    }
+    /* 5. Fallback. */
+    snprintf(buf, buflen, "connection error");
+    return buf;
+}
+
 static void conn_eventcb(struct bufferevent *bev, short what, void *arg) {
-    (void)bev;
     tcp_conn_t *c = (tcp_conn_t *)arg;
     if (what & BEV_EVENT_CONNECTED) {
         /* Only meaningful when a coroutine parked in fan.tcp.connect is
@@ -166,7 +245,14 @@ static void conn_eventcb(struct bufferevent *bev, short what, void *arg) {
     }
     if (what & (BEV_EVENT_EOF | BEV_EVENT_ERROR | BEV_EVENT_TIMEOUT)) {
         if (what & BEV_EVENT_EOF) c->eof = 1;
-        if (what & BEV_EVENT_ERROR) conn_set_err(c, "connection error");
+        if (what & BEV_EVENT_ERROR) {
+            /* M21.2 — replace "connection error" with a specific reason
+             * (DNS / TLS / socket errno).  Local buffer is copied into
+             * c->err by conn_set_err, so its lifetime ends here. */
+            char errbuf[256];
+            const char *msg = conn_describe_bev_error(bev, errbuf, sizeof errbuf);
+            conn_set_err(c, msg);
+        }
         if (what & BEV_EVENT_TIMEOUT) conn_set_err(c, "timeout");
         c->connecting = 0;
         if (c->co) {
@@ -186,16 +272,30 @@ static void conn_eventcb(struct bufferevent *bev, short what, void *arg) {
 }
 
 /* ---- fan.tcp.connect(host, port[, opts]) ----------------------------------
- * opts (optional table): { ssl=bool, verify_peer=bool, verify_host=bool }.
+ * opts (optional table):
+ *   { ssl=bool,                       -- wrap in TLS via net/tls (OpenSSL)
+ *     verify_peer=bool,               -- SSL_VERIFY_PEER on/off (default on)
+ *     verify_host=bool,               -- X509_CHECK_FLAG hostname bind (default on)
+ *     ssl_host=string,                -- override SNI + verify hostname (M21.2)
+ *     cainfo=path, capath=path        -- custom CA bundle / dir for verify (M21.2)
+ *   }.
  * When ssl=true the connection is wrapped in TLS via net/tls (OpenSSL). The
  * rest of the connection lifecycle (send/receive/drain/close) is identical to
- * a plain TCP conn because both share the same bufferevent machinery. */
+ * a plain TCP conn because both share the same bufferevent machinery.
+ *
+ * M21.2 — Extended the opts surface (ssl_host / cainfo / capath) so
+ * pure-Lua HTTPS through fan.http_lua can pin its own CA bundle rather
+ * than being locked to the process-wide default trust store.  The
+ * extended path routes through fan_tls_client_bev_ex; the legacy no-CA
+ * path still uses fan_tls_client_bev for byte-compatibility with
+ * unchanged callers. */
 static int l_connect(lua_State *L) {
     const char *host = luaL_checkstring(L, 1);
     int port = (int)luaL_checkinteger(L, 2);
     if (port < 1 || port > 65535) return luaL_error(L, "port out of range");
 
     int use_ssl = 0, verify_peer = 1, verify_host = 1;
+    const char *ssl_host = NULL, *cainfo = NULL, *capath = NULL;
     if (lua_type(L, 3) == LUA_TTABLE) {
         lua_getfield(L, 3, "ssl");
         use_ssl = lua_toboolean(L, -1);
@@ -205,6 +305,20 @@ static int l_connect(lua_State *L) {
         lua_pop(L, 1);
         lua_getfield(L, 3, "verify_host");
         if (!lua_isnil(L, -1)) verify_host = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+        /* M21.2 — cainfo / capath / ssl_host.  The string pointers live on
+         * the Lua stack for the duration of this C call, which is enough:
+         * fan_tls_client_bev_ex builds the SSL_CTX (and caches it via
+         * fingerprint) before returning, so the strings need not survive
+         * past bev construction. */
+        lua_getfield(L, 3, "ssl_host");
+        if (lua_isstring(L, -1)) ssl_host = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "cainfo");
+        if (lua_isstring(L, -1)) cainfo = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "capath");
+        if (lua_isstring(L, -1)) capath = lua_tostring(L, -1);
         lua_pop(L, 1);
     }
 
@@ -218,7 +332,17 @@ static int l_connect(lua_State *L) {
     struct bufferevent *bev;
     if (use_ssl) {
         const char *terr = NULL;
-        bev = fan_tls_client_bev(base, host, verify_peer, verify_host, &terr);
+        /* M21.2 — route through _ex when the caller supplied any extended
+         * TLS param.  The legacy fan_tls_client_bev path is kept for the
+         * common case (no per-request options) so unchanged callers hit
+         * exactly the same code as before. */
+        if (ssl_host || cainfo || capath) {
+            bev = fan_tls_client_bev_ex(base, host, ssl_host,
+                                        verify_peer, verify_host,
+                                        cainfo, capath, NULL, NULL, &terr);
+        } else {
+            bev = fan_tls_client_bev(base, host, verify_peer, verify_host, &terr);
+        }
         if (!bev) {
             luaL_unref(L, LUA_REGISTRYINDEX, ref);
             return luaL_error(L, "tls connect failed: %s", terr ? terr : "unknown");

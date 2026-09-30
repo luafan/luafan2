@@ -1,4 +1,4 @@
-# fan.tcp — TCP client + server (M2 + M17)
+# fan.tcp — TCP client + server (M2 + M17 + M21)
 
 `fan.tcp` exposes both a coroutine-yielding API (M2) and a callback-based
 async API (M17).  The callback API restores the v1 `fan.tcpd` contract
@@ -201,8 +201,42 @@ read/write timeout, connect_timeout, GC) routes through a helper that
 checks the flag first.  The self-ref pin is released **after** the
 callback dispatch so the callback always sees a live `self`.
 
+## M21 additions
+
+`fan.tcp.connect(host, port, opts)` gained three fields that were
+previously only reachable via `connect_async{...}`:
+
+| opts key   | Type   | Effect                                         |
+|-----------|--------|-------------------------------------------------|
+| `ssl_host` | string | Override SNI + hostname verification identity  |
+| `cainfo`   | path   | Custom CA bundle (PEM) for peer verification   |
+| `capath`   | path   | Custom hashed CA directory                      |
+
+When any of the three is set the code routes through
+`fan_tls_client_bev_ex` (which fingerprint-caches an `SSL_CTX` per
+distinct parameter set).  When none is set the legacy
+`fan_tls_client_bev` path is preserved byte-for-byte and reuses
+the process-wide `g_client_ctx` singleton.
+
+`conn_eventcb` now surfaces a specific error reason when
+`BEV_EVENT_ERROR` fires:
+
+1. DNS: `"dns error: <evutil_gai_strerror>"`
+2. TLS: `"tls error: <ERR_error_string>"`
+3. TLS verify: `"tls verify failed: <X509_verify_cert_error_string>"`
+4. Socket: `"socket error: <evutil_socket_error_to_string>"`
+5. Fallback: `"connection error"` (only when no source yielded info)
+
+The pre-M21 `"connection error"` opaque literal is gone from the
+common path.  See [M21 TLS diagnostics](m21-tls-diagnostics.md)
+for the full story.
+
 ## Tests
 
 Contract-level assertions live in `tests/lua/test_tcp_async.lua`
-(41 cases, all three modes green: normal / --asan / --coverage; C
-line coverage 85.4%, Lua 90.41%).
+(41 cases) and `tests/lua/test_tcp.lua` (11 cases).  M21 TLS
+pinning + diagnostics are covered by
+`tests/lua/test_http_tls.lua` (9 cases; three of them exercise the
+tcp.c error surface directly via bad host / closed port / bad
+DNS).  All three modes green: normal / --asan / --coverage; C
+line coverage **85.5%**, Lua **90.58%**.

@@ -13,6 +13,7 @@
 #ifndef FAN2_NET_TLS_H
 #define FAN2_NET_TLS_H
 
+#include <stddef.h>            /* size_t */
 #include <lua.h>
 #include <event2/bufferevent.h>
 
@@ -54,6 +55,16 @@ struct bufferevent *fan_tls_client_bev_ex(struct event_base *base,
                                           const char *pkcs12_path,
                                           const char *pkcs12_password,
                                           const char **err);
+
+/* M21.1 — Fill `buf` with the OpenSSL peer-verify reason for `ssl_ptr`
+ * (opaque SSL *).  Returns 1 if buf populated (verify failed with a
+ * known reason), 0 if the handshake succeeded or ssl is not a TLS
+ * bufferevent.  Used by tcp.c to append the specific X509 reason to a
+ * "connect failed" error so callers see e.g.
+ * "connection error: unable to get local issuer certificate" instead
+ * of a bare "connection error".  Safe to call with ssl_ptr = NULL
+ * (returns 0). */
+int fan_tls_client_verify_reason(void *ssl_ptr, char *buf, size_t buflen);
 
 /* ---- server side --------------------------------------------------------- */
 

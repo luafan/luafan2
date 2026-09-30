@@ -252,10 +252,23 @@ local function do_once(opts)
   local verify = opts.verify
   if verify == nil then verify = true end
 
+  -- M21 — Forward CA bundle knobs down to fan.tcp.connect so pure-Lua HTTPS
+  -- can pin its own trust store.  Per-request opts.cainfo/opts.capath win;
+  -- if unset we fall back to the module-scoped M._cainfo / M._capath (set
+  -- via M.cainfo()/M.capath(), v1-compatible).  fan.tcp.connect (M21.2)
+  -- routes through fan_tls_client_bev_ex when either is non-nil.  ssl_host
+  -- (opts.ssl_host) lets callers override the SNI + verify hostname —
+  -- useful when connecting to a raw IP or a private hostname aliased
+  -- through /etc/hosts for the same origin cert.
+  local cainfo = opts.cainfo or M._cainfo
+  local capath = opts.capath or M._capath
   local conn, cerr = fan.tcp.connect(host, port, {
     ssl = (scheme == "https"),
     verify_peer = verify,
     verify_host = verify,
+    ssl_host    = opts.ssl_host,
+    cainfo      = cainfo,
+    capath      = capath,
   })
   if not conn then return nil, "connect: " .. tostring(cerr) end
 
@@ -464,11 +477,12 @@ end
 -- registry via KEY_COOKIE_JAR / KEY_CAINFO / KEY_CAPATH). Same shape:
 -- string arg, no return value, one call replaces the previous value.
 --
--- The Lua HTTP backend does NOT yet consume these (libcurl's cookie jar
--- and CA bundle handling is what the M13 C module will pick up). We
--- keep the setters so v1 code that unconditionally calls them at
--- startup doesn't crash, and stash the values under M.* for the C
--- backend to read once it lands.
+-- M21 update — cainfo / capath are now consumed by the pure-Lua request
+-- path (see the fan.tcp.connect call earlier in this module).  cookiejar
+-- is still only wired up on the libcurl (C) backend; the Lua backend
+-- treats it as a stashed value so v1 boot code that calls
+-- M.cookiejar(path) unconditionally still works, and the C backend
+-- picks it up when it's the active backend.
 function M.cookiejar(path)
   M._cookiejar = tostring(path)
 end
