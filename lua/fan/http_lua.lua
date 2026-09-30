@@ -87,13 +87,31 @@ local Reader = {}
 Reader.__index = Reader
 
 local function new_reader(conn)
-  return setmetatable({ conn = conn, buf = "", pos = 1 }, Reader)
+  return setmetatable({ conn = conn, buf = "", pos = 1, onreceive = nil }, Reader)
+end
+
+local function invoke_onreceive(reader, chunk)
+  if not reader.onreceive or #chunk == 0 then return true end
+  local ok, result = pcall(reader.onreceive, chunk)
+  if not ok then
+    reader.callback_error = "onreceive callback error: " .. tostring(result)
+    return nil, reader.callback_error
+  end
+  if result == false then
+    reader.callback_error = "onreceive callback canceled"
+    return nil, reader.callback_error
+  end
+  return true
+end
+
+local function reader_error(reader, err)
+  return nil, reader.callback_error or err
 end
 
 -- pull more bytes from the socket into the buffer; returns true or nil,err
 function Reader:_fill()
   local data, err = self.conn:receive()
-  if not data then return nil, err or "eof" end
+  if not data then return reader_error(self, err or "eof") end
   -- compact consumed prefix occasionally to bound memory
   if self.pos > 1 then
     self.buf = self.buf:sub(self.pos)
@@ -125,20 +143,26 @@ function Reader:read_n(n)
   end
   local out = self.buf:sub(self.pos, self.pos + n - 1)
   self.pos = self.pos + n
+  local ok, err = invoke_onreceive(self, out)
+  if not ok then return reader_error(self, err) end
   return out
 end
 
 -- read all remaining bytes until EOF; returns string (possibly empty)
 function Reader:read_until_eof()
   local chunks = {}
-  -- whatever is already buffered
   if self.pos <= #self.buf then
-    chunks[#chunks + 1] = self.buf:sub(self.pos)
+    local pending = self.buf:sub(self.pos)
     self.pos = #self.buf + 1
+    local ok, err = invoke_onreceive(self, pending)
+    if not ok then return reader_error(self, err) end
+    chunks[#chunks + 1] = pending
   end
   while true do
     local data = self.conn:receive()
     if not data then break end
+    local ok, err = invoke_onreceive(self, data)
+    if not ok then return reader_error(self, err) end
     chunks[#chunks + 1] = data
   end
   return table.concat(chunks)
@@ -266,6 +290,29 @@ local function do_once(opts)
 
   local headers, herr = read_headers(reader)
   if not headers then conn:close(); return nil, herr end
+
+  if opts.onheader ~= nil and type(opts.onheader) ~= "function" then
+    conn:close(); return nil, "onheader must be a function"
+  end
+  if opts.onreceive ~= nil and type(opts.onreceive) ~= "function" then
+    conn:close(); return nil, "onreceive must be a function"
+  end
+  if opts.onheader then
+    local header_info = {
+      status = code,
+      responseCode = code,
+      reason = reason,
+      headers = headers,
+    }
+    local ok, result = pcall(opts.onheader, header_info)
+    if not ok then
+      conn:close(); return nil, "onheader callback error: " .. tostring(result)
+    end
+    if result == false then
+      conn:close(); return nil, "onheader callback canceled"
+    end
+  end
+  reader.onreceive = opts.onreceive
 
   -- body framing
   local resp_body = ""

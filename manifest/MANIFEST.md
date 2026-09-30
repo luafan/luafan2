@@ -50,12 +50,8 @@ not planning notes.
   a Luan-private `tcpd_compat.lua`.
 
 ## HTTP client
-- [fan.http](http.md) — M4 + M13.C + M16.4 HTTP/1.1 client shim over
-  either the libcurl C backend or the pure-Lua backend.  Shared
-  response shape (`status` + v1-compatible `responseCode` alias),
-  verb helpers that accept both `get(url, opts)` and single-table
-  `get{url=...}` forms, and a module-level
-  `set_default_follow_redirects(bool)` knob for v1 compatibility.
+- [fan.http](http.md) — M4 + M13.C + M16.4 + M20.1 HTTP/1.1 client shim over either the libcurl C backend or the pure-Lua backend. Shared response shape, both verb forms, redirect defaults, and Pure Lua `onheader`/decoded-body `onreceive` callbacks; M20.2 C/curl streaming callbacks remain pending.
+- [M20.1 HTTP streaming callbacks](m20-http-streaming.md) — Pure Lua `onheader`/`onreceive`, buffered compatibility, and callback cancellation/error semantics.
 
 ## Codecs
 - [fan.json](json.md) — M9 + M16.3 native JSON codec.  RFC 8259

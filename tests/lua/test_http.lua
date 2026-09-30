@@ -520,4 +520,78 @@ s:test("M16.4: set_default_follow_redirects(false) makes 302 stop at hop 1", fun
   T.truthy(resp.headers["location"])   -- Location header preserved
 end)
 
+s:test("M20.1: onheader once and onreceive streams decoded body while buffering", function()
+  local PORT = 24434
+  local server, resp, headers_seen, pieces
+  run(function()
+    server = assert(fan.tcp.bind("127.0.0.1", PORT, function(conn)
+      local req = read_request(conn)
+      conn:send(resp_chunked(200, "OK", { "one", "two", "three" }))
+      fan.sleep(0.03)
+      conn:close()
+    end))
+    headers_seen = 0
+    pieces = {}
+    resp = http.request({
+      backend = "lua",
+      url = BASE .. PORT .. "/chunked",
+      onheader = function(h)
+        headers_seen = headers_seen + 1
+        T.eq(h.status, 200)
+        T.eq(h.responseCode, 200)
+        T.eq(h.headers["transfer-encoding"], "chunked")
+      end,
+      onreceive = function(chunk)
+        pieces[#pieces + 1] = chunk
+      end,
+    })
+  end)
+  if server then server:close() end
+  T.not_nil(resp)
+  T.eq(headers_seen, 1)
+  T.eq(table.concat(pieces), "onetwothree")
+  T.eq(resp.body, "onetwothree")
+end)
+
+s:test("M20.1: callback false cancels body read with a clear error", function()
+  local PORT = 24435
+  local server, resp, err, calls
+  run(function()
+    server = start_origin(PORT)
+    calls = 0
+    resp, err = http.get(BASE .. PORT .. "/hello", {
+      backend = "lua",
+      onreceive = function()
+        calls = calls + 1
+        return false
+      end,
+    })
+  end)
+  if server then server:close() end
+  T.is_nil(resp)
+  T.eq(calls, 1)
+  T.truthy(err:find("onreceive callback canceled", 1, true))
+end)
+
+s:test("M20.1: callback exception and onheader cancellation are errors", function()
+  local PORT = 24436
+  local server, resp, err
+  run(function()
+    server = start_origin(PORT)
+    resp, err = http.get(BASE .. PORT .. "/hello", {
+      backend = "lua",
+      onreceive = function() error("boom-stream") end,
+    })
+    server:close()
+    server = start_origin(PORT)
+    resp, err = http.get(BASE .. PORT .. "/hello", {
+      backend = "lua",
+      onheader = function() return false end,
+    })
+  end)
+  if server then server:close() end
+  T.is_nil(resp)
+  T.truthy(err:find("onheader callback canceled", 1, true))
+end)
+
 os.exit(T.run(s))
