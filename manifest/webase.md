@@ -17,7 +17,7 @@ directory. Full contract in `webase/README.md`.
 | MIME types       | `webase/mimetypes.lua`   | Parses `webase/mime.types`             |
 | LRU cache        | `webase/lru.lua`         | lua-lru (MIT), verbatim from v1        |
 | Weak proxy       | `webase/weakify.lua`     | Verbatim from v1                       |
-| MariaDB pool     | `webase/ctxpool.lua`     | Not ported — hard error with migration |
+| MariaDB pool     | `webase/ctxpool.lua`     | Compatibility facade over pool + ORM; schema scan and safe borrow/return |
 
 ## Kernel dependencies added for the port
 
@@ -59,6 +59,22 @@ Covered by `tests/lua/test_webase_webfile.lua`: happy path (gzip
 succeeds, header set), forced failure via monkey-patched
 `fan.zlib.gzip_compress`, and the "no Accept-Encoding" identity path.
 
+## ctxpool compatibility facade (M25)
+
+`webase/ctxpool.lua` restores the legacy `require("ctxpool")` entry point
+on top of `fan.mariadb.pool` and `fan.orm`. It scans
+`WORKDIR/database/*.lua`, accepts both a map of table schemas and the
+single-table `{name=..., schema=...}` form, and exposes `pop`, `push`,
+`safe`, `close`, and `stats`. A borrowed context exposes models through both
+`ctx.models[name]` and `ctx[name]`. `maria_socket` / `MARIA_SOCKET` selects a
+Unix socket without also sending a host option; otherwise the normal host
+configuration is used.
+
+`tests/lua/test_ctxpool.lua` includes a live MariaDB test with six concurrent
+Fan coroutines. Each coroutine performs 100 insert/yield/find request cycles
+through `safe` (600 MariaDB request cycles total), then the test verifies the
+final row count. It skips only when the local MariaDB server is unavailable.
+
 ## Deliberate differences from the retired webase image
 
 The release image intentionally does **not** carry legacy image-only
@@ -71,9 +87,6 @@ extras that the downstream application does not use:
   clients; use the native `fan.http` C backend or the pure-Lua backend.
 * **standalone `gcm.so`** — not needed; AES-GCM is provided by the native
   `fan.crypto.gcm` API.
-* `ctxpool` — API shape diverged from luafan2's `fan.mariadb.pool` +
-  `fan.orm`; applications using the retired helper must migrate to those
-  native APIs.
 
 These are intentional scope decisions, not missing release-image files.
 The standard Web service contract remains available: `/root/core.lua`,

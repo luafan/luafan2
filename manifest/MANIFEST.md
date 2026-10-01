@@ -15,8 +15,9 @@ not planning notes.
   under `/root/` and starts `/root/core.lua` by default via `CMD`.
 
 ## Application framework
-- [Webase](webase.md) — M12.2 web application framework ported from
-  v1's tmp/webase/, with LRU + mapping + service registry.
+- [Webase](webase.md) — M12.2 + M25 web application framework ported from
+  v1's tmp/webase/, with LRU + mapping + service registry and a restored
+  ctxpool compatibility facade over MariaDB pool + ORM.
 
 ## Database
 - [fan.sqlite3](sqlite3.md) — M5 + M16.1 native SQLite3 binding.

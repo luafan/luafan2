@@ -1,29 +1,150 @@
--- webase/ctxpool.lua — MariaDB connection-pool + ORM aggregator (NOT ported).
+-- ctxpool.lua — compatibility facade for the retired webase ctxpool.
 --
--- webase v1 defined its own tiny `ctxpool` that scanned `database/*.lua`,
--- pulled the ORM table definitions each file returned, and wrapped
--- `mariadb.pool.new(list)` around them. It relied on v1's specific
--- `mariadb.pool.new(orm_tables)` signature, which took the ORM schema
--- table as its only argument.
+-- The v1 module scanned WORKDIR/database/*.lua, merged the returned schema
+-- tables, and exposed a pool whose pop() returned an ORM context. LuaFan v2
+-- keeps that application-facing facade while using its split primitives:
+-- fan.mariadb.pool for connections and fan.orm for models.
 --
--- luafan2 has a different (and much simpler) shape:
---   fan.mariadb.pool.new{ host=..., user=..., password=..., database=...,
---                         charset=..., max_size=..., idle_ping=... }
---   -> Pool object with :with(fn) / :acquire() / :release(db) / :stats()
---
--- fan.orm is separate; it consumes a `db` handle acquired from the pool,
--- so there's no equivalent "orm table + connection pool" fused constructor
--- to write here.
---
--- Because the shapes differ this much, we deliberately do NOT ship a
--- shim: any callable pretending to be v1's ctxpool would either quietly
--- drop the ORM schema on the floor or force us to reimplement v1's ORM
--- surface, both of which are worse than an explicit re-port. Apps that
--- need a DB pool should call fan.mariadb.pool.new{...} directly from
--- their service or handle modules; ORM users additionally
--- `require "fan.orm"` and build a wrapper around `pool:with(fn)`.
---
--- Loading this module returns an error so mis-ports fail loudly instead
--- of hiding a schema-missing surface behind a table lookup.
-error("webase.ctxpool is not ported to luafan2. Use fan.mariadb.pool.new{...} " ..
-      "and fan.orm directly. See webase/README.md for the migration note.", 0)
+-- Compatibility surface:
+--   local ctxpool = require "ctxpool"
+--   local ctx = ctxpool:pop()
+--   local User = ctx.models.users
+--   ctxpool:push(ctx)
+--   ctxpool:safe(function(ctx) ... end)
+
+local fan = require("fan")
+local posix = fan.posix
+local mariadb_pool = require("fan.mariadb.pool")
+local orm = require("fan.orm")
+
+local MODULE_EXT = _G.MODULE_EXT or ".lua"
+local MODULE_LOAD_MODE = _G.MODULE_LOAD_MODE or "bt"
+local workdir = _G.WORKDIR or ""
+local database_dir = workdir .. "database"
+local config = require("config")
+
+local function env_or_config(key, env_name)
+  local value = config[key]
+  if value ~= nil then return value end
+  return os.getenv(env_name)
+end
+
+local function load_schemas()
+  local schemas = {}
+  local entries = posix.readdir(database_dir)
+  if not entries then return schemas end
+  table.sort(entries)
+  for _, filename in ipairs(entries) do
+    if filename:sub(1, 1) ~= "." and filename:sub(-#MODULE_EXT) == MODULE_EXT then
+      local path = database_dir .. "/" .. filename
+      local env = setmetatable({ WORKDIR = workdir }, { __index = _G })
+      local chunk, err = loadfile(path, MODULE_LOAD_MODE, env)
+      if not chunk then
+        print("[ctxpool] load error: " .. path .. ": " .. tostring(err))
+      else
+        local ok, returned = pcall(chunk)
+        if not ok then
+          print("[ctxpool] exec error: " .. path .. ": " .. tostring(returned))
+        elseif type(returned) == "table" then
+          local single_name = returned.name or returned.table
+          if single_name and type(returned.schema) == "table" then
+            schemas[single_name] = returned.schema
+          else
+            for name, schema in pairs(returned) do
+              if type(name) == "string" and type(schema) == "table" then
+                schemas[name] = schema
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  return schemas
+end
+
+local schemas = load_schemas()
+local maria_socket = env_or_config("maria_socket", "MARIA_SOCKET")
+local pool_opts = {
+  port = tonumber(env_or_config("maria_port", "MARIA_PORT")),
+  user = env_or_config("maria_user", "MARIA_USERNAME") or "root",
+  password = env_or_config("maria_passwd", "MARIA_PASSWORD") or "",
+  database = env_or_config("maria_database", "MARIA_DATABASE_NAME"),
+  charset = env_or_config("maria_charset", "MARIA_CHARSET") or "utf8mb4",
+  max_size = tonumber(env_or_config("maria_pool_size", "MARIA_POOL_COUNT")) or 10,
+  idle_ping = true,
+}
+if maria_socket then
+  pool_opts.unix_socket = maria_socket
+else
+  pool_opts.host = env_or_config("maria_host", "MARIA_HOST") or "127.0.0.1"
+end
+
+local backend, pool_err = mariadb_pool.new(pool_opts)
+if not backend then
+  error("ctxpool: cannot create MariaDB pool: " .. tostring(pool_err), 0)
+end
+
+local facade = {
+  pool = backend,
+  schemas = schemas,
+  map = setmetatable({}, { __mode = "k" }),
+  index = 0,
+}
+
+function facade:pop()
+  local db, err = self.pool:acquire()
+  if not db then return nil, err end
+  local ctx = self.map[db]
+  if not ctx then
+    local driver = orm.mariadb_driver(db)
+    ctx = orm.new_context(driver)
+    ctx.models = {}
+    for name, schema in pairs(self.schemas) do
+      local model, define_err = ctx:define(name, schema)
+      if not model then
+        self.pool:release(db, define_err)
+        return nil, "ctxpool: define " .. name .. ": " .. tostring(define_err)
+      end
+      ctx.models[name] = model
+      -- v1 callers commonly accessed models directly on the context;
+      -- keep both ctx.models[name] and ctx[name] for compatibility.
+      ctx[name] = model
+    end
+    self.index = self.index + 1
+    ctx.index = self.index
+    ctx._ctxpool_db = db
+    self.map[db] = ctx
+  end
+  return ctx
+end
+
+function facade:push(ctx, err)
+  if type(ctx) ~= "table" or not ctx._ctxpool_db then
+    return nil, "ctxpool: invalid context"
+  end
+  self.pool:release(ctx._ctxpool_db, err)
+  return true
+end
+
+function facade:safe(fn, ...)
+  if type(fn) ~= "function" then return nil, "ctxpool: safe expects function" end
+  local ctx, err = self:pop()
+  if not ctx then return nil, err end
+  local results = table.pack(xpcall(fn, debug.traceback, ctx, ...))
+  local ok = results[1]
+  self:push(ctx, ok and nil or results[2])
+  if not ok then return nil, results[2] end
+  table.remove(results, 1)
+  return table.unpack(results, 1, results.n - 1)
+end
+
+function facade:close()
+  return self.pool:close()
+end
+
+function facade:stats()
+  return self.pool:stats()
+end
+
+return facade
