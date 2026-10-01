@@ -148,6 +148,7 @@ RUN fan -v \
 # relative to the application bundle. Start in /root so the bundled service
 # is self-contained; callers can still override the working directory with
 # `docker run -w ...` when mounting an application.
+VOLUME ["/root/config.d"]
 WORKDIR /root
 ENTRYPOINT ["/usr/local/bin/fan"]
 CMD ["/root/core.lua"]
