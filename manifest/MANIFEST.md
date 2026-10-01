@@ -9,9 +9,10 @@ not planning notes.
 - [Dual-form delivery: ./fan + fan.so](fan-so-module.md) — M15 thin
   executable that dlopen()s the fan.so shared module for dependency
   isolation (RTLD_LOCAL), while keeping v2's lua_State/loop ownership.
-- [CI and release Docker images](ci-and-release-image.md) — M14.F
+- [CI and release Docker images](ci-and-release-image.md) — M14.F + M24
   GitHub Actions workflows + ubuntu / alpine runtime images published
-  to Docker Hub.
+  to Docker Hub. M24 bundles the downstream application files flat
+  under `/root/` and starts `/root/core.lua` by default via `CMD`.
 
 ## Application framework
 - [Webase](webase.md) — M12.2 web application framework ported from

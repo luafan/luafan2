@@ -116,17 +116,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /src/build/fan       /usr/local/bin/fan
 COPY --from=builder /src/build/fan.so    /usr/local/bin/fan.so
 COPY --from=builder /src/lua/            /usr/local/share/lua/5.3/
+# M24: ship the application framework as top-level runtime files for
+# downstream consumers. Do not create a `webase/` directory in the image:
+# flatten the historical source directory into /root/ so mime.types,
+# config.d, core.lua, route.lua, service.lua, and webfile.lua are available
+# at the paths expected by the standalone downstream image.
+COPY --from=builder /src/webase/         /root/
 
-# Smoke test: image must at least be able to load fan and every Lua
-# module we ship. If a module has a require chain broken by the copy
-# layout, this catches it at image-build time rather than at first
-# user run.
+# Make the flattened application modules visible both to the build-time
+# smoke test and to the default runtime command.
+ENV LUA_PATH="/root/?.lua;/root/?/init.lua;/usr/local/share/lua/5.3/?.lua;/usr/local/share/lua/5.3/?/init.lua;;"
+
+# Smoke test: verify the fan runtime surface and top-level application
+# files/resources consumed by downstream images. Loading the application
+# modules also proves LUA_PATH and mime.types resolution, without starting
+# the listening server in core.lua itself.
 RUN fan -v \
- && fan -e "for _, m in ipairs({'fan','fan.compat','fan.utils','fan.log','fan.json','fan.objectbuf','fan.stream','fan.httpd','fan.http','fan.websocket','fan.orm','fan.pool','fan.worker','fan.popen','fan.upnp','fan.reliable_udp','fan.connector','fan.config','config'}) do assert(require(m), m) end print('release image smoke: OK')"
+ && test -f /root/mime.types \
+ && test -f /root/core.lua \
+ && test -f /root/route.lua \
+ && test -f /root/service.lua \
+ && test -f /root/webfile.lua \
+ && test -d /root/config.d \
+ && fan -e "for _, m in ipairs({'fan','fan.compat','fan.utils','fan.log','fan.json','fan.objectbuf','fan.stream','fan.httpd','fan.http','fan.websocket','fan.orm','fan.pool','fan.worker','fan.popen','fan.upnp','fan.reliable_udp','fan.connector','fan.config','config','route','mapping','service','mimetypes','webfile'}) do assert(require(m), m) end print('release image smoke: OK')"
 
-# Users typically `docker run -v $PWD:/w -w /w luafan/luafan2 script.lua`.
-# Setting WORKDIR here means bare `docker run luafan/luafan2 script.lua`
-# with no volume still runs (script.lua would need to be in the image,
-# which is only useful for embedded distributions).
+# The default image command preserves the old application-image behavior:
+# `docker run image` starts the bundled core.lua. Passing another script
+# overrides CMD while retaining the fan executable entrypoint.
 WORKDIR /work
 ENTRYPOINT ["/usr/local/bin/fan"]
+CMD ["/root/core.lua"]

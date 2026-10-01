@@ -24,11 +24,21 @@ Both release images are multi-stage:
 2. **runtime** — stock base image (`ubuntu:22.04` / `alpine:3.20.10`) +
    the exact runtime `.so` packages that match `ldd fan`. `fan` binary
    installed to `/usr/local/bin/fan`, Lua modules to
-   `/usr/local/share/lua/5.3/`. `ENTRYPOINT = ["/usr/local/bin/fan"]`,
-   `WORKDIR = /work`.
+   `/usr/local/share/lua/5.3/`, and the downstream application bundle is
+   flattened into `/root/` (`mime.types`, `config.d/`, `core.lua`,
+   `route.lua`, `service.lua`, `webfile.lua`, and its sibling Lua files).
+   `LUA_PATH` includes `/root/`. `ENTRYPOINT = ["/usr/local/bin/fan"]`,
+   `CMD = ["/root/core.lua"]`, `WORKDIR = /work`.
+
+The image has no framework subdirectory in the application bundle. The
+source-tree directory is only a build input; the runtime contract is the
+flat `/root/` layout consumed by downstream subscribers. Running the image
+without arguments starts `/root/core.lua`, matching the legacy application
+image behavior. Passing another script overrides the default `CMD`.
 
 Every release image build ends with an in-image smoke test that runs
-`fan -v` and `require`s the full v2 module surface
+`fan -v`, checks the flat `/root/` application files, loads the top-level
+application modules, and `require`s the full v2 module surface
 (`fan`, `fan.compat`, `fan.utils`, `fan.log`, `fan.json`,
 `fan.objectbuf`, `fan.stream`, `fan.httpd`, `fan.http`,
 `fan.websocket`, `fan.orm`, `fan.pool`, `fan.worker`, `fan.popen`,

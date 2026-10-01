@@ -119,12 +119,29 @@ RUN apk add --no-cache \
 COPY --from=builder /src/build/fan     /usr/local/bin/fan
 COPY --from=builder /src/build/fan.so  /usr/local/bin/fan.so
 COPY --from=builder /src/lua/          /usr/local/share/lua/5.3/
+# M24: ship the application framework as top-level runtime files for
+# downstream consumers. Do not create a `webase/` directory in the image:
+# flatten the historical source directory into /root/.
+COPY --from=builder /src/webase/       /root/
 
-# Same smoke test as the ubuntu image. If any `require` chain assumes
-# glibc-only behavior (unlikely — v2 has explicit musl gates), it will
-# surface here before the image is tagged.
+# Make the flattened application modules visible both to the build-time
+# smoke test and to the default runtime command.
+ENV LUA_PATH="/root/?.lua;/root/?/init.lua;/usr/local/share/lua/5.3/?.lua;/usr/local/share/lua/5.3/?/init.lua;;"
+
+# Same smoke test as the Ubuntu image, including the top-level application
+# resources consumed by downstream images. Loading the application modules
+# also proves LUA_PATH and mime.types resolution without starting the server.
 RUN fan -v \
- && fan -e "for _, m in ipairs({'fan','fan.compat','fan.utils','fan.log','fan.json','fan.objectbuf','fan.stream','fan.httpd','fan.http','fan.websocket','fan.orm','fan.pool','fan.worker','fan.popen','fan.upnp','fan.reliable_udp','fan.connector','fan.config','config'}) do assert(require(m), m) end print('release image smoke: OK')"
+ && test -f /root/mime.types \
+ && test -f /root/core.lua \
+ && test -f /root/route.lua \
+ && test -f /root/service.lua \
+ && test -f /root/webfile.lua \
+ && test -d /root/config.d \
+ && fan -e "for _, m in ipairs({'fan','fan.compat','fan.utils','fan.log','fan.json','fan.objectbuf','fan.stream','fan.httpd','fan.http','fan.websocket','fan.orm','fan.pool','fan.worker','fan.popen','fan.upnp','fan.reliable_udp','fan.connector','fan.config','config','route','mapping','service','mimetypes','webfile'}) do assert(require(m), m) end print('release image smoke: OK')"
 
+# Default application-image behavior: start the bundled core.lua; passing
+# another script overrides CMD while retaining the fan executable entrypoint.
 WORKDIR /work
 ENTRYPOINT ["/usr/local/bin/fan"]
+CMD ["/root/core.lua"]
