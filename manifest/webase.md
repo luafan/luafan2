@@ -59,11 +59,23 @@ Covered by `tests/lua/test_webase_webfile.lua`: happy path (gzip
 succeeds, header set), forced failure via monkey-patched
 `fan.zlib.gzip_compress`, and the "no Accept-Encoding" identity path.
 
-## Not ported (deliberate)
+## Deliberate differences from the retired webase image
 
-* `curl-impersonate` — not in scope for luafan2.
+The release image intentionally does **not** carry legacy image-only
+extras that the downstream application does not use:
+
+* **jQuery Mobile / demo assets** — the image ships only the small
+  architecture landing page at `/web/index.html`; production users mount
+  their own `WEBROOT` and assets.
+* **curl-impersonate / curlimp.so** — not needed by the luafan2 HTTP
+  clients; use the native `fan.http` C backend or the pure-Lua backend.
+* **standalone `gcm.so`** — not needed; AES-GCM is provided by the native
+  `fan.crypto.gcm` API.
 * `ctxpool` — API shape diverged from luafan2's `fan.mariadb.pool` +
-  `fan.orm`; documented replacement in `webase/README.md`.
-* v1 `web/` demo assets (jquery 1.x etc.) — the release image now ships
-  a small self-contained architecture landing page at `/web/index.html`,
-  but users still mount their own WEBROOT for application content.
+  `fan.orm`; applications using the retired helper must migrate to those
+  native APIs.
+
+These are intentional scope decisions, not missing release-image files.
+The standard Web service contract remains available: `/root/core.lua`,
+`handle/`, `service/`, `mapping/`, `web/`, `mime.types`, route dispatch,
+static files, gzip, ETag, and the default port 2201 service.
