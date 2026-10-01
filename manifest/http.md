@@ -103,12 +103,16 @@ For both HTTP server backends, request fields keep the v1 meanings:
   `"b=2&a=1&tag=x&tag=y"`.
 * `req.params` is the decoded parameter map used for convenient
   name-based access.  It contains query parameters merged with
-  `application/x-www-form-urlencoded` body parameters; body values
-  win on key collisions.  Values are strings.
+  `application/x-www-form-urlencoded` body parameters; the last
+  value wins on key collisions.  Values are strings.
+* `req:query_values(name)` returns a new array containing every
+  decoded value for that URL query key, in original wire order.
+  It does not include form-body values.
 
 `req.query` must not be changed to a table.  Code needing parsed
-values should use `req.params`; code needing exact ordering or
-repeated-key fidelity should use the raw `req.query` string.
+single values should use `req.params`; code needing exact ordering
+or repeated-key fidelity should use the raw `req.query` string or
+`req:query_values(name)`. No `query_map` field is added.
 
 ## CA bundle pinning + TLS diagnostics (M21)
 

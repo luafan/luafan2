@@ -21,10 +21,13 @@
   forwarded transparently to httpd_c.bind.
 
   The Lua backend implements the full v1 fan.httpd contract including
-  chunked reply, addheader, WebSocket. The C backend for M14.C-a only
-  implements: bind, request:method/path/query/headers/body/available/read,
-  response:reply(status, headers, body). Chunked / addheader / HTTPS /
-  WebSocket come in later M14.C milestones.
+  chunked reply, addheader, WebSocket. Both backends expose the v1
+  request query fields: req.query is the raw query string and
+  req.params is a last-value decoded map. Both also expose
+  req:query_values(name) for lossless repeated-key access. The C
+  backend for M14.C-a only implements: bind, request:method/path/query/
+  headers/body/available/read, response:reply(status, headers, body).
+  Chunked / addheader / HTTPS / WebSocket come in later M14.C milestones.
 
   Both backends expose the same top-level function:
       httpd.bind{ host, port, handler = fn, ssl = ..., onService = ... }

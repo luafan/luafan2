@@ -239,4 +239,4 @@ pinning + diagnostics are covered by
 `tests/lua/test_http_tls.lua` (9 cases; three of them exercise the
 tcp.c error surface directly via bad host / closed port / bad
 DNS).  All three modes green: normal / --asan / --coverage; C
-line coverage **85.6%**, Lua **90.58%**.
+line coverage **85.5%**, Lua **90.58%**.

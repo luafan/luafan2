@@ -1137,6 +1137,63 @@ static int l_req_ws_accept(lua_State *L) {
 #endif
 }
 
+/* M22: return every decoded value for one raw query key in wire order.
+ * req.params intentionally remains a last-value map; this method is the
+ * lossless multi-value API and only considers the URL query, not form body. */
+static int l_req_query_values(lua_State *L) {
+    check_request(L, 1);
+    const char *name = luaL_checkstring(L, 2);
+    FAN_GETUSERVALUE(L, 1);
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        return 1;
+    }
+    lua_getfield(L, -1, "query");
+    size_t qlen = 0;
+    const char *qs = lua_tolstring(L, -1, &qlen);
+    lua_newtable(L);
+    int out = lua_gettop(L);
+    int n = 0;
+    if (qs && qlen > 0) {
+        const char *p = qs;
+        const char *end = qs + qlen;
+        while (p < end) {
+            const char *amp = memchr(p, '&', (size_t)(end - p));
+            const char *pair_end = amp ? amp : end;
+            size_t pair_len = (size_t)(pair_end - p);
+            if (pair_len > 0) {
+                const char *eq = memchr(p, '=', pair_len);
+                size_t klen = eq ? (size_t)(eq - p) : pair_len;
+                size_t vlen = eq ? pair_len - klen - 1 : 0;
+                char *kraw = (char *)malloc(klen + 1);
+                char *vraw = (char *)malloc(vlen + 1);
+                char *kdec = (char *)malloc(klen + 1);
+                char *vdec = (char *)malloc(vlen + 1);
+                if (kraw && vraw && kdec && vdec) {
+                    memcpy(kraw, p, klen); kraw[klen] = '\0';
+                    if (eq) memcpy(vraw, eq + 1, vlen);
+                    vraw[vlen] = '\0';
+                    urldecode_into(kraw, kdec);
+                    urldecode_into(vraw, vdec);
+                    if (strcmp(kdec, name) == 0) {
+                        lua_pushstring(L, vdec);
+                        lua_rawseti(L, out, ++n);
+                    }
+                }
+                free(kraw); free(vraw); free(kdec); free(vdec);
+            }
+            if (!amp) break;
+            p = amp + 1;
+        }
+    }
+    /* Remove the temporary query string and uservalue while preserving the
+     * result table on top. Function arguments remain below these temporaries. */
+    lua_remove(L, -2); /* query string */
+    lua_remove(L, -2); /* uservalue */
+    return 1;
+}
+
 /* __gc: free the body buffer and any un-flushed pending headers. Do not
  * touch r->ev — libevent owns it. */
 static int req_gc(lua_State *L) {
@@ -1151,6 +1208,7 @@ static int req_gc(lua_State *L) {
 
 static const luaL_Reg request_methods[] = {
     {"available",             l_req_available},
+    {"query_values",          l_req_query_values},
     {"read",                  l_req_read},
     {"reply",                 l_req_reply},
     {"addheader",             l_req_addheader},

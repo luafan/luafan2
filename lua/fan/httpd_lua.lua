@@ -70,6 +70,22 @@ local function parse_query(qs)
   return t
 end
 
+-- Return every value for one query key in wire order. This is deliberately
+-- separate from parse_query: req.params keeps the v1-compatible last-value
+-- map, while req:query_values(name) provides lossless repeated-key access.
+local function query_values(qs, name)
+  local values = {}
+  if not qs or qs == "" then return values end
+  for pair in qs:gmatch("[^&]+") do
+    local k, v = pair:match("^([^=]*)=(.*)$")
+    local key = urldecode(k or pair)
+    if key == name then
+      values[#values + 1] = urldecode(v or "")
+    end
+  end
+  return values
+end
+
 local function split_path_query(target)
   local q = target:find("?", 1, true)
   if not q then return target, "" end
@@ -197,6 +213,12 @@ local function parse_request(reader)
   }
   function req:available()
     return #self.body - (self._body_pos - 1)
+  end
+  function req:query_values(name)
+    if type(name) ~= "string" then
+      error("query_values: name must be a string", 2)
+    end
+    return query_values(self.query, name)
   end
   function req:read(n)
     -- Match v1: no arg -> return whatever is left in one shot;
