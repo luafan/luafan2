@@ -31,9 +31,10 @@
       cert = "server.pem",   -- PEM cert path (when ssl=true)
       key  = "server.key",   -- PEM key path  (when ssl=true)
       handler = function(req, resp)
-        -- req  = { method, path, query, headers, body, http_version }
+        -- req  = { method, path, query, params, headers, body, http_version }
         --   req.headers is a lowercased-key table
-        --   req.query  is a decoded k=v table (may be empty)
+        --   req.query  is the raw query string (may be empty)
+        --   req.params  is the decoded query/form parameter map
         -- resp:reply(status, headers, body)                -- one-shot
         -- resp:reply_start(status, headers)                -- chunked mode
         -- resp:reply_chunk(data)                           -- 0 or more
@@ -187,8 +188,8 @@ local function parse_request(reader)
     method = method:upper(),
     path = path,
     target = target,        -- raw request-target incl. query
-    query = query,
-    params = params,
+    query = qs,             -- v1: raw query string, not the parsed map
+    params = params,        -- decoded query + form map
     headers = headers,
     body = body,
     http_version = ver,

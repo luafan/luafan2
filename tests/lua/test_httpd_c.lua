@@ -58,9 +58,9 @@ s:test("GET: method/path/query/headers/body parsed via C backend", function()
     server = assert(httpd.bind{
       port = PORT, backend = "c",
       handler = function(req, r)
-        local body = string.format("M=%s P=%s Q.a=%s Q.b=%s H.xfoo=%s V=%s",
+        local body = string.format("M=%s P=%s Q=%s Params.a=%s Params.b=%s H.xfoo=%s V=%s",
           req.method, req.path,
-          req.query.a or "", req.query.b or "",
+          req.query, req.params.a or "", req.params.b or "",
           req.headers["x-foo"] or "",
           req.http_version or "")
         r:reply(200, { ["Content-Type"] = "text/plain",
@@ -77,8 +77,9 @@ s:test("GET: method/path/query/headers/body parsed via C backend", function()
   T.eq(resp.headers["x-server"], "fan.httpd_c")
   T.truthy(resp.body:find("M=GET",     1, true), resp.body)
   T.truthy(resp.body:find("P=/hello",  1, true), resp.body)
-  T.truthy(resp.body:find("Q.a=1",     1, true), resp.body)
-  T.truthy(resp.body:find("Q.b=two",   1, true), resp.body)
+  T.truthy(resp.body:find("Q=a=1&b=two", 1, true), resp.body)
+  T.truthy(resp.body:find("Params.a=1", 1, true), resp.body)
+  T.truthy(resp.body:find("Params.b=two", 1, true), resp.body)
   T.truthy(resp.body:find("H.xfoo=bar",1, true), resp.body)
   T.truthy(resp.body:find("V=1.1",     1, true), resp.body)
 end)

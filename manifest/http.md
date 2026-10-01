@@ -93,6 +93,23 @@ contract, but the summary is:
 * Returning `false` (or raising) from either callback cancels the
   in-flight request and produces `nil, err`.
 
+## HTTP server request query contract (v1 compatibility)
+
+For both HTTP server backends, request fields keep the v1 meanings:
+
+* `req.query` is the **raw query string** from the request target,
+  with its original parameter order, repeated keys, and percent
+  encoding preserved.  For `/items?b=2&a=1&tag=x&tag=y`, it is
+  `"b=2&a=1&tag=x&tag=y"`.
+* `req.params` is the decoded parameter map used for convenient
+  name-based access.  It contains query parameters merged with
+  `application/x-www-form-urlencoded` body parameters; body values
+  win on key collisions.  Values are strings.
+
+`req.query` must not be changed to a table.  Code needing parsed
+values should use `req.params`; code needing exact ordering or
+repeated-key fidelity should use the raw `req.query` string.
+
 ## CA bundle pinning + TLS diagnostics (M21)
 
 Both backends accept `cainfo` (PEM bundle path) and `capath`

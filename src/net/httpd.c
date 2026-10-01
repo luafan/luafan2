@@ -429,7 +429,8 @@ static void request_fill_fields(lua_State *L, int req_idx, struct evhttp_request
     lua_pushstring(L, uri);
     lua_setfield(L, -2, "target");
 
-    /* path + query: parse a mutable copy */
+    /* path + raw query.  v1 exposes req.query as the original query
+     * string; the decoded query/form map is req.params below. */
     size_t ulen = strlen(uri);
     char *ucopy = (char *)malloc(ulen + 1);
     if (ucopy) {
@@ -438,13 +439,13 @@ static void request_fill_fields(lua_State *L, int req_idx, struct evhttp_request
         split_path_query(ucopy, &path, &query);
         lua_pushstring(L, path);
         lua_setfield(L, -2, "path");
-        push_query_table(L, query);
+        lua_pushstring(L, query);
         lua_setfield(L, -2, "query");
         free(ucopy);
     } else {
         lua_pushliteral(L, "");
         lua_setfield(L, -2, "path");
-        lua_newtable(L);
+        lua_pushliteral(L, "");
         lua_setfield(L, -2, "query");
     }
 

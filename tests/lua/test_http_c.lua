@@ -95,11 +95,11 @@ s:test("GET: query table merged into URL", function()
     server = assert(httpd_lua.bind{
       port = PORT,
       onService = function(req, r)
-        -- req.target is the raw request line target incl. query (path is
-        -- pre-split by fan.httpd_lua).
+        -- req.target is the raw request line target incl. query; req.query
+        -- is the v1-compatible raw query string and req.params is the map.
         seen_target = req.target
         r:reply(200, { ["Content-Type"] = "text/plain" },
-          "a=" .. tostring(req.query.a) .. ";b=" .. tostring(req.query.b))
+          "a=" .. tostring(req.params.a) .. ";b=" .. tostring(req.params.b))
       end,
     })
     resp = http.request{
@@ -344,8 +344,8 @@ s:test("Multiple concurrent C-backend requests are isolated", function()
     server = assert(httpd_lua.bind{
       port = PORT,
       onService = function(req, r)
-        -- Slot from query so the origin can prove we saw N distinct calls.
-        local slot = req.query.slot or "?"
+        -- Slot from decoded params; req.query remains the raw string.
+        local slot = req.params.slot or "?"
         r:reply(200, { ["Content-Type"] = "text/plain" },
           "slot=" .. slot)
       end,

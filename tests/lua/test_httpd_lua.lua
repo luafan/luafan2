@@ -48,14 +48,15 @@ s:test("Lua backend: GET method/path/query/headers/body round-trip", function()
       port = PORT,
       handler = function(req, r)
         r:reply(200, { ["Content-Type"] = "text/plain" },
-          req.method .. " " .. req.path .. " a=" .. (req.query.a or ""))
+          req.method .. " " .. req.path .. " query=" .. req.query
+          .. " a=" .. (req.params.a or ""))
       end,
     })
     resp = http.get(BASE .. PORT .. "/x?a=42")
   end)
   if server then server:close() end
   T.eq(resp.status, 200)
-  T.eq(resp.body, "GET /x a=42")
+  T.eq(resp.body, "GET /x query=a=42 a=42")
 end)
 
 s:test("Lua backend: chunked reply_start/chunk/end streams data", function()

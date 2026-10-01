@@ -1,5 +1,12 @@
 # M21 — Pure-Lua HTTPS: CA bundle pinning + TLS diagnostics
 
+## v1 HTTP server query compatibility
+
+This milestone preserves the v1 HTTP server request-field contract:
+`req.query` is the raw, ordered query string; `req.params` is the
+parsed query/form map.  The implementation does not introduce a
+`query_map` field and does not reinterpret `req.query` as a table.
+
 Pure-Lua HTTPS through `fan.http_lua` regains v1 parity on two axes
 that were quietly missing since the initial v2 landing:
 
@@ -209,6 +216,6 @@ absent.
 | --asan                   | 51 / 51 | 9 / 9              | 0 error  | 0     |
 | --coverage --enforce     | 51 / 51 | 9 / 9              | n/a      | n/a   |
 
-Coverage: **C 85.5 %** (target 85 %), **Lua 90.58 %** (target 90 %).
+Coverage: **C 85.6 %** (target 85 %), **Lua 90.58 %** (target 90 %).
 Previous milestone M20.2 baseline was C 85.5 %, Lua 90.39 %; M21
 lifted Lua coverage by 0.19 pp with the new TLS tests.

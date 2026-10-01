@@ -46,9 +46,9 @@ s:test("GET: method/path/query parsed, custom headers echo, 200 body", function(
   local server, resp
   run(function()
     server = assert(httpd.bind{ port = PORT, handler = function(req, resp)
-      local body = string.format("M=%s P=%s Q.a=%s Q.b=%s H.xfoo=%s",
+      local body = string.format("M=%s P=%s Q=%s Params.a=%s Params.b=%s H.xfoo=%s",
         req.method, req.path,
-        req.query.a or "", req.query.b or "",
+        req.query, req.params.a or "", req.params.b or "",
         req.headers["x-foo"] or "")
       resp:reply(200, { ["Content-Type"] = "text/plain",
                         ["X-Server"] = "fan.httpd" }, body)
@@ -63,8 +63,9 @@ s:test("GET: method/path/query parsed, custom headers echo, 200 body", function(
   T.eq(resp.headers["x-server"], "fan.httpd")
   T.truthy(resp.body:find("M=GET",   1, true))
   T.truthy(resp.body:find("P=/hello",1, true))
-  T.truthy(resp.body:find("Q.a=1",   1, true))
-  T.truthy(resp.body:find("Q.b=two", 1, true))
+  T.truthy(resp.body:find("Q=a=1&b=two", 1, true))
+  T.truthy(resp.body:find("Params.a=1", 1, true))
+  T.truthy(resp.body:find("Params.b=two", 1, true))
   T.truthy(resp.body:find("H.xfoo=bar", 1, true))
 end)
 
