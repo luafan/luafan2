@@ -9,6 +9,8 @@ not planning notes.
 - [Dual-form delivery: ./fan + fan.so](fan-so-module.md) — M15 thin
   executable that dlopen()s the fan.so shared module for dependency
   isolation (RTLD_LOCAL), while keeping v2's lua_State/loop ownership.
+- [Persistent event loop](event-loop.md) — `fan.loop()` keeps the service
+  loop alive when no events are pending and exits via explicit `fan.loopbreak()`.
 - [CI and release Docker images](ci-and-release-image.md) — M14.F + M24
   GitHub Actions workflows + ubuntu / alpine runtime images published
   to Docker Hub. M24 bundles the downstream application files flat

@@ -46,17 +46,17 @@ int fan_loop_run(void) {
     struct event_base *base = fan_loop_base();
     if (!base) return -1;
     /* If a break was requested before we even started (e.g. a coroutine ran to
-     * completion synchronously and called fan.loopbreak), honour it up front:
-     * evdns and other infrastructure may hold long-lived events that would
-     * otherwise keep event_base_dispatch blocked forever. */
+     * completion synchronously and called fan.loopbreak), honour it up front. */
     if (g_break_requested) {
         g_break_requested = 0;
         return 0;
     }
     g_running = 1;
-    /* EVLOOP_NO_EXIT_ON_EMPTY is NOT used: in M1 the loop returns when there is
-     * nothing left to do, which is the natural "script finished" semantics. */
-    int rc = event_base_dispatch(base);
+    /* v1 compatibility: fan.loop() is a service loop and remains alive even
+     * when the current event set is empty. Applications leave it via the
+     * explicit fan.loopbreak() API; this is important for webase servers that
+     * install listeners after startup or receive events later. */
+    int rc = event_base_loop(base, EVLOOP_NO_EXIT_ON_EMPTY);
     g_running = 0;
     g_break_requested = 0;
     return rc;

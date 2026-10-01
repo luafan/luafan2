@@ -21,7 +21,8 @@ struct evdns_base *fan_loop_dnsbase(void);
  * main base; M6 will return the current worker's base when on a worker thread. */
 struct event_base *fan_loop_current_base(void);
 
-/* Run the loop until loopbreak / no more events. Returns 0 normally. */
+/* Run the loop until loopbreak. The loop remains alive when no events exist,
+ * matching v1 service-loop semantics. Returns 0 normally. */
 int fan_loop_run(void);
 
 /* Request the running loop to stop after the current iteration. */
