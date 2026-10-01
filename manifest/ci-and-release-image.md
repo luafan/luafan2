@@ -26,7 +26,8 @@ Both release images are multi-stage:
    installed to `/usr/local/bin/fan`, Lua modules to
    `/usr/local/share/lua/5.3/`, and the downstream application bundle is
    flattened into `/root/` (`mime.types`, `config.d/`, `core.lua`,
-   `route.lua`, `service.lua`, `webfile.lua`, and its sibling Lua files).
+   `route.lua`, `service.lua`, `webfile.lua`, `web/index.html`, and its
+   sibling Lua files).
    `LUA_PATH` includes `/root/`. `ENTRYPOINT = ["/usr/local/bin/fan"]`,
    `CMD = ["/root/core.lua"]`, `WORKDIR = /root`.
 

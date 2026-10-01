@@ -137,6 +137,7 @@ RUN fan -v \
  && test -f /root/route.lua \
  && test -f /root/service.lua \
  && test -f /root/webfile.lua \
+ && test -f /root/web/index.html \
  && test -d /root/config.d \
  && fan -e "for _, m in ipairs({'fan','fan.compat','fan.utils','fan.log','fan.json','fan.objectbuf','fan.stream','fan.httpd','fan.http','fan.websocket','fan.orm','fan.pool','fan.worker','fan.popen','fan.upnp','fan.reliable_udp','fan.connector','fan.config','config','route','mapping','service','mimetypes','webfile'}) do assert(require(m), m) end print('release image smoke: OK')"
 

@@ -64,5 +64,6 @@ succeeds, header set), forced failure via monkey-patched
 * `curl-impersonate` — not in scope for luafan2.
 * `ctxpool` — API shape diverged from luafan2's `fan.mariadb.pool` +
   `fan.orm`; documented replacement in `webase/README.md`.
-* v1 `web/` demo assets (jquery 1.x etc.) — the port ships no static
-  demo tree; users mount their own WEBROOT.
+* v1 `web/` demo assets (jquery 1.x etc.) — the release image now ships
+  a small self-contained architecture landing page at `/web/index.html`,
+  but users still mount their own WEBROOT for application content.
