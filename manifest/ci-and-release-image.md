@@ -28,7 +28,7 @@ Both release images are multi-stage:
    flattened into `/root/` (`mime.types`, `config.d/`, `core.lua`,
    `route.lua`, `service.lua`, `webfile.lua`, and its sibling Lua files).
    `LUA_PATH` includes `/root/`. `ENTRYPOINT = ["/usr/local/bin/fan"]`,
-   `CMD = ["/root/core.lua"]`, `WORKDIR = /work`.
+   `CMD = ["/root/core.lua"]`, `WORKDIR = /root`.
 
 The image has no framework subdirectory in the application bundle. The
 source-tree directory is only a build input; the runtime contract is the

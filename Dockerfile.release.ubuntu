@@ -143,6 +143,10 @@ RUN fan -v \
 # The default image command preserves the old application-image behavior:
 # `docker run image` starts the bundled core.lua. Passing another script
 # overrides CMD while retaining the fan executable entrypoint.
-WORKDIR /work
+# core.lua resolves config.d, mapping, mime.types, and the default web root
+# relative to the application bundle. Start in /root so the bundled service
+# is self-contained; callers can still override the working directory with
+# `docker run -w ...` when mounting an application.
+WORKDIR /root
 ENTRYPOINT ["/usr/local/bin/fan"]
 CMD ["/root/core.lua"]
