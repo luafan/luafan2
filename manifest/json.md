@@ -1,4 +1,4 @@
-# fan.json — JSON codec (M9 + M16.3)
+# fan.json — JSON codec (M9 + M16.3 + M23)
 
 Native C JSON codec, registered under `fan.json` when compiled in.  No
 external dependencies (no cjson / lua-cjson / dkjson).  Full RFC 8259
@@ -104,19 +104,38 @@ v1's `fan.json` had these API points; the M16.3 status is:
   `json.array()` to force array shape (nil slots become `null`)
 - **Integer subtype (Lua 5.3+)** — preserved on encode; decode pushes
   integer for whole values within `lua_Integer` range, else float
+- **Float precision** — `%.17g` on encode, guaranteeing lossless IEEE
+  754 double round-trip (`json.decode(json.encode(n)) == n` holds for
+  every finite double).  **Do not** use `%.15g` as a "cleaner output"
+  shortcut — it corrupts up to 2 bits of mantissa.  The regression
+  test `floats round-trip within IEEE 754 doubles (M23: assert exact
+  bit identity)` compares the decoded value to the Lua original
+  directly, not via a re-encoded string, so a stealth downgrade
+  cannot pass by having both sides lose precision together.
 - **String escapes** — control chars < 0x20 → `\uXXXX`; `"` and `\`
   escaped; forward slash `/` NOT escaped (RFC allows either)
 - **UTF-8** — pass-through verbatim in strings; no `\uXXXX` for BMP chars
 - **Non-string object keys** — `encode` raises (JSON spec)
+- **Circular references** (M23) — `encode` raises
+  `"cannot encode a circular table as JSON"` when the recursion path
+  revisits a table pointer.  Detection is **per-recursion-path**, not
+  a global visited set: shared but non-circular subtables (e.g.
+  `root = { left = child, right = child }`) still encode correctly.
+  Pre-M23 behaviour was infinite recursion → SIGSEGV, uncatchable by
+  pcall.
 
 ## Test coverage
 
-`tests/lua/test_json.lua` — 20 tests covering:
+`tests/lua/test_json.lua` — 27 tests covering:
 - primitive round-trips
 - empty containers (with disambiguation)
 - deep nesting
 - string escapes + UTF-8 encode/decode + surrogate pairs
-- integer/float preservation, NaN/Inf rejection
+- integer preservation
+- **M23**: float round-trip asserting *bit-exact* equality to the
+  Lua original (not via re-encoded string); includes
+  `1.2345678901234567` as the key `%.15g`-vs-`%.17g` regression sample
+- NaN/Inf rejection on encode
 - decoder error message quality (line/col)
 - json.null round-trip inside objects
 - indent option pretty-print
@@ -126,6 +145,11 @@ v1's `fan.json` had these API points; the M16.3 status is:
   `false`, `{}`)
 - **M16.3**: real-world case — decoded body with explicit `null` field,
   presence check combined with encode + is_nonempty_string sanity chain
+- **M23 — circular-reference detection (6 cases)**:
+  self-ref object; mutual-ref; self-ref array; shared non-circular
+  subtable (must succeed — path-local, not global); 3-level deep
+  cycle (grandparent reached); encoder state clean after error (next
+  encode of a non-cyclic value succeeds)
 
 ## Build
 

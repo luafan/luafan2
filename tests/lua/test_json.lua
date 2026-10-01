@@ -118,12 +118,29 @@ s:test("integers preserved (within Lua's number precision)", function()
   T.eq(enc, "12345678901234")
 end)
 
-s:test("floats round-trip within IEEE 754 doubles", function()
-  local samples = { 3.14, -0.5, 1e-10, 1e15, 1.5, 0.1 + 0.2 }
+s:test("floats round-trip within IEEE 754 doubles (M23: assert exact bit identity)",
+function()
+  -- Assertion rationale (M23): comparing re-encoded strings via
+  --   T.eq(json.encode(dec), json.encode(n))
+  -- is a false-positive trap — if the encoder itself loses precision
+  -- (e.g. %.15g instead of %.17g), both sides round-trip through the
+  -- SAME lossy encoder and the test still passes while real callers
+  -- silently lose bits.  Assert the decoded value equals the original
+  -- Lua number directly, which only holds when the serialised form has
+  -- enough significant digits for a lossless double round-trip
+  -- (%.17g).  1.2345678901234567 is the key regression sample: with
+  -- %.15g it decodes to 1.234567890123456(9) and this test fails.
+  local samples = {
+    3.14, -0.5, 1e-10, 1e15, 1.5,
+    0.1 + 0.2,
+    1.2345678901234567,  -- M23 regression gate: fails under %.15g
+    1.7976931348623157e308,  -- near DBL_MAX
+    2.2250738585072014e-308, -- near DBL_MIN (normal)
+    -1.2345678901234567,
+  }
   for _, n in ipairs(samples) do
     local dec = json.decode(json.encode(n))
-    -- allow tiny rounding; assert same bit pattern via string round-trip
-    T.eq(json.encode(dec), json.encode(n))
+    T.eq(dec, n, "round-trip lost precision for " .. tostring(n))
   end
 end)
 
@@ -226,6 +243,98 @@ s:test("json.is_present + decode: null-sentinel survives, is_present picks it up
   T.eq(json.is_nonempty_string(body.a), false)  -- null sentinel is a table, not string
   T.eq(json.is_nonempty_string(body.c), false)  -- "" is empty
   T.eq(json.is_nonempty_string(json.encode(body.b)), true)  -- "42" is non-empty
+end)
+
+-- ---------------------------------------------------------------------------
+-- M23 — circular-reference detection on encode.
+--
+-- Pre-M23 behaviour was infinite recursion → stack exhaustion → SIGSEGV
+-- (process dies, pcall cannot catch it).  M23 added a per-request
+-- recursion-path stack in enc_t; the test matrix below locks in the
+-- contract so a regression (e.g. "fix" that uses a global visited set,
+-- or removes the pop on error) is caught immediately.
+--
+-- Helper: assert that fn raises and the error message matches a pattern.
+-- T.error_raised in the framework only checks that *some* error was
+-- raised; here we also want to pin the human-readable message so a
+-- vague "something failed" is treated as a regression.
+local function assert_error_contains(fn, needle, msg)
+  local ok, err = pcall(fn)
+  if ok then error((msg or "expected error") .. ": no error raised", 2) end
+  local es = tostring(err)
+  if not es:find(needle, 1, true) then
+    error(string.format(
+      "%s: error message missing %q: got %q",
+      msg or "expected error", needle, es), 2)
+  end
+end
+
+s:test("cycle: self-referencing table raises, does NOT crash", function()
+  local v = {}
+  v.self = v
+  assert_error_contains(function() json.encode(v) end,
+    "circular table",
+    "self-referencing table must raise")
+end)
+
+s:test("cycle: mutually-referencing tables raise", function()
+  local a, b = {}, {}
+  a.b = b
+  b.a = a
+  assert_error_contains(function() json.encode(a) end,
+    "circular table",
+    "mutual-reference cycle must raise")
+end)
+
+s:test("cycle: self-referencing array raises", function()
+  -- enc_array path (looks_like_array + rawseti self at [1])
+  local arr = {}
+  arr[1] = arr
+  assert_error_contains(function() json.encode(arr) end,
+    "circular table",
+    "self-referencing array must raise")
+end)
+
+s:test("cycle: shared non-circular subtable encodes successfully", function()
+  -- This is the critical "not a global visited set" regression gate.
+  -- The same child appears in two sibling branches; nothing is circular,
+  -- so encoding must succeed.  An implementation that marks "already
+  -- seen" globally (instead of per-recursion-path) would wrongly reject
+  -- this.
+  local child = { value = 1 }
+  local root = {
+    left  = child,
+    right = child,
+  }
+  local enc = json.encode(root)
+  -- Keys are sorted ("left" < "right"), both branches get the full
+  -- subtree body.
+  T.eq(enc, '{"left":{"value":1},"right":{"value":1}}')
+end)
+
+s:test("cycle: deep nested cycle (grandparent reached) raises", function()
+  -- a.b.c.a — cycle through three levels, not an immediate self-ref.
+  local a = {}
+  a.b = { c = { d = nil } }
+  a.b.c.d = a
+  assert_error_contains(function() json.encode(a) end,
+    "circular table",
+    "3-level cycle must raise")
+end)
+
+s:test("cycle: after a failed encode, encoder state is clean "
+    .. "(next encode of a non-cyclic value succeeds)", function()
+  -- Regression guard against any state leaked between calls.  Both
+  -- the path stack and the output buffer are per-call locals in
+  -- l_encode, so this should always hold — but a future refactor
+  -- that caches enc_t across calls would break it.
+  local cyclic = {}
+  cyclic.self = cyclic
+  pcall(json.encode, cyclic)         -- swallow the error
+  -- Immediately re-encode a sane value; must still work.
+  local ok, enc = pcall(json.encode, { a = 1, b = 2 })
+  T.truthy(ok, "encode after cycle error must succeed: " .. tostring(enc))
+  T.eq(enc, '{"a":1,"b":2}')
 end)
 
 os.exit(T.run(s))

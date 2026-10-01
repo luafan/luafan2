@@ -93,7 +93,56 @@ typedef struct {
     /* pretty-print state */
     const char *indent;   /* NULL if compact */
     size_t      indent_len;
+    /* M23 — circular-reference detection.  Stack of table pointers
+     * (lua_topointer) along the current recursion path.  Entering a
+     * table pushes; leaving pops.  Encountering a pointer already on
+     * the stack means a cycle — the encoder bails out with a Lua error
+     * rather than recursing forever.
+     *
+     * Design: path-local, NOT a global visited set.  Shared but
+     * non-circular sub-tables (e.g. `root = { left = child,
+     * right = child }`) must still encode successfully; they only
+     * appear on the stack during their own sub-encode and are popped
+     * before the sibling branch runs.  See tests/lua/test_json.lua
+     * `cycle: shared non-circular subtable` for the regression gate.
+     *
+     * Memory: lazily allocated (NULL until the first table push); grows
+     * geometrically; freed in l_encode cleanup (both success and error
+     * paths).  Starting capacity 16 covers typical hand-rolled JSON
+     * trees without any realloc. */
+    const void **path;
+    size_t       path_len;
+    size_t       path_cap;
 } enc_t;
+
+/* M23 — push a table pointer onto the recursion-path stack.  Returns
+ * 0 on success, -1 on realloc failure (encoder bails out as OOM). */
+static int enc_path_push(enc_t *e, const void *p) {
+    if (e->path_len == e->path_cap) {
+        size_t nc = e->path_cap ? e->path_cap * 2 : 16;
+        const void **np = (const void **)realloc((void *)e->path,
+                                                 nc * sizeof(*np));
+        if (!np) return -1;
+        e->path = np;
+        e->path_cap = nc;
+    }
+    e->path[e->path_len++] = p;
+    return 0;
+}
+
+static void enc_path_pop(enc_t *e) {
+    if (e->path_len > 0) e->path_len--;
+}
+
+/* M23 — return 1 if `p` is already on the recursion path (cycle).  Linear
+ * scan is intentional: typical JSON depth is small (<32), a hash set would
+ * cost more than it saves, and the scan is read-only and cache-friendly. */
+static int enc_path_contains(const enc_t *e, const void *p) {
+    for (size_t i = 0; i < e->path_len; i++) {
+        if (e->path[i] == p) return 1;
+    }
+    return 0;
+}
 
 static int enc_reserve(enc_t *e, size_t need) {
     if (e->len + need <= e->cap) return 0;
@@ -197,6 +246,17 @@ static int enc_array(lua_State *L, enc_t *e, int idx, int depth) {
         if (enc_newline_indent(e, depth + 1) != 0) return -1;
         lua_rawgeti(L, idx, i);
         int rc = enc_value(L, e, lua_gettop(L), depth + 1);
+        if (rc == -2) {
+            /* M23 — enc_value pushed its error string on top of the
+             * element value we rawgeti'd.  Blindly `lua_pop(L, 1)`
+             * would discard the error and leave the raw element as
+             * the "error object", so pcall callers would see
+             * "table: 0x..." instead of our message.  lua_replace
+             * drops the element in place of the error string, which
+             * stays on top as the error object. */
+            lua_replace(L, -2);
+            return rc;
+        }
         lua_pop(L, 1);
         if (rc < 0) return rc;
     }
@@ -259,6 +319,20 @@ static int enc_object(lua_State *L, enc_t *e, int idx, int depth) {
         }
         lua_getfield(L, idx, k);
         int rc = enc_value(L, e, lua_gettop(L), depth + 1);
+        if (rc == -2) {
+            /* M23 — enc_value pushed its error string.  Stack layout is
+             *   [..., keys_table, child_value, err_string]
+             * We need to leave only err_string on top for the outer
+             * lua_error, drop keys_table and child_value, and free the
+             * sorted-key array.  lua_replace(-3) overwrites keys_table
+             * with err_string (compacting it to the slot where keys
+             * were); a single lua_pop(1) then drops child_value and
+             * leaves err_string on top. */
+            lua_replace(L, -3);
+            lua_pop(L, 1);
+            free((void *)arr);
+            return rc;
+        }
         lua_pop(L, 1);
         if (rc < 0) { free((void *)arr); return rc; }
     }
@@ -302,11 +376,36 @@ static int enc_value(lua_State *L, enc_t *e, int idx, int depth) {
     }
     if (t == LUA_TTABLE) {
         if (is_null(L, idx)) return enc_str(e, "null");
-        if (has_jsontype(L, idx, "array"))  return enc_array(L, e, idx, depth);
-        if (has_jsontype(L, idx, "object")) return enc_object(L, e, idx, depth);
-        /* untagged */
-        if (looks_like_array(L, idx)) return enc_array(L, e, idx, depth);
-        return enc_object(L, e, idx, depth);
+
+        /* M23 — cycle check.  Must run before dispatching into
+         * enc_array / enc_object (the only recursing branches).
+         * is_null / has_jsontype do not recurse so they are safe to
+         * run above the push. */
+        const void *tp = lua_topointer(L, idx);
+        if (tp) {
+            if (enc_path_contains(e, tp)) {
+                lua_pushliteral(L,
+                    "cannot encode a circular table as JSON");
+                return -2;
+            }
+            if (enc_path_push(e, tp) != 0) {
+                /* realloc of path stack failed — treat as OOM. */
+                return -1;
+            }
+        }
+
+        int rc;
+        if      (has_jsontype(L, idx, "array"))  rc = enc_array(L, e, idx, depth);
+        else if (has_jsontype(L, idx, "object")) rc = enc_object(L, e, idx, depth);
+        else if (looks_like_array(L, idx))       rc = enc_array(L, e, idx, depth);
+        else                                     rc = enc_object(L, e, idx, depth);
+
+        /* Pop regardless of rc so the stack reflects "we have left this
+         * subtree".  On error the whole encoder unwinds, but keeping
+         * the stack consistent lets a caller inspect e->path_len (and
+         * is cheap). */
+        if (tp) enc_path_pop(e);
+        return rc;
     }
     lua_pushfstring(L, "cannot encode a Lua %s to JSON", lua_typename(L, t));
     return -2;
@@ -330,6 +429,7 @@ static int l_encode(lua_State *L) {
     int rc = enc_value(L, &e, 1, 0);
     if (rc < 0) {
         free(e.buf);
+        free((void *)e.path);          /* M23 — release path stack */
         if (rc == -2) {
             /* error string was pushed by enc_value */
             return lua_error(L);
@@ -338,6 +438,7 @@ static int l_encode(lua_State *L) {
     }
     lua_pushlstring(L, e.buf, e.len);
     free(e.buf);
+    free((void *)e.path);              /* M23 — release path stack */
     return 1;
 }
 
