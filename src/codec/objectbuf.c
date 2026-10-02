@@ -1,424 +1,857 @@
 /*
- * codec/objectbuf.c — LuaFan v2 objectbuf codec (compact binary serialiser).
+ * codec/objectbuf.c — LuaFan objectbuf: native, v1-compatible wire codec.
  *
- * Same wire format as the Lua reference implementation that briefly lived at
- * lua/fan/objectbuf.lua (commit 2a91ba9), rewritten in C for performance.
- * See lua/fan/objectbuf.lua in git history for the annotated design.
+ * This is the public fan.objectbuf implementation. It follows the LuaFan v1
+ * section/index protocol exactly (see tmp/luafan/src/objectbuf.c and the
+ * fan/objectbuf/init.lua wrapper) so that v1 and v2 can exchange data in both
+ * directions and share symbol tables.
  *
- * Tags (single byte):
- *   0x00 NIL   0x01 FALSE   0x02 TRUE
- *   0x03 INT8  0x04 INT16   0x05 INT32   0x06 INT64
- *   0x07 FLOAT (8B little-endian double)
- *   0x08 STR8   1B u8 len + bytes
- *   0x09 STR16  2B u16 len (LE) + bytes
- *   0x0a STR32  4B u32 len (LE) + bytes
- *   0x0b TABLE  4B u32 arr_n (LE) + 4B u32 map_n (LE)
- *                + arr_n values + map_n (key, value) pairs
- *   0x0c REF    4B u32 refid (LE)  -> back-reference to prior table
+ * Wire format:
+ *   flag byte = OR of:
+ *     0x80 HAS_NUMBER   0x40 HAS_U30   0x20 HAS_STRING   0x08 HAS_TABLE
+ *     if none of those bits is set the flag is a boolean (0 = false, 1 = true)
+ *   each present section, in order number -> u30 -> string -> table:
+ *     u30(count) followed by the encoded values
+ *       number : 8-byte little-endian IEEE-754 double
+ *       u30    : u30 varint (7-bit septets, LEB128 style)
+ *       string : u30(length) + raw bytes
+ *       table  : u30(total body length) + u30(array_n) + array_n * u30(ref)
+ *                + (u30(key_ref) u30(value_ref)) repeated
+ *   A builtin index dictionary starts at 2: 1 = false, 2 = true. Values are
+ *   assigned increasing indices as their section is emitted; tables are
+ *   assigned after strings. The root object is the first item of the LAST
+ *   section that carries data (selection order table -> string -> u30 -> number).
  *
- * Cycle handling: encoder assigns a fresh refid to every table BEFORE
- * recursing; decoder registers the fresh table BEFORE descending. So
- * self-references and mutual cycles resolve to reference-identical tables.
+ * Symbol table (from objectbuf.symbol):
+ *     { [1] = map (value -> index),
+ *       [2] = map_vk (index -> value),
+ *       [3] = index (first free index) }
+ *   Indices are assigned in the order: sorted strings, sorted numbers,
+ *   sorted u30 integers.
  */
 #include "objectbuf.h"
-#include "../platform.h"
-#include "../util/bytearray.h"
 
 #include <lauxlib.h>
-#include <string.h>
-#include <stdlib.h>
+#include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
-enum {
-    T_NIL = 0x00, T_FALSE = 0x01, T_TRUE = 0x02,
-    T_INT8 = 0x03, T_INT16 = 0x04, T_INT32 = 0x05, T_INT64 = 0x06,
-    T_FLOAT = 0x07,
-    T_STR8 = 0x08, T_STR16 = 0x09, T_STR32 = 0x0a,
-    T_TABLE = 0x0b, T_REF = 0x0c,
-};
+#define OBJ_HAS_NUMBER 0x80
+#define OBJ_HAS_U30    0x40
+#define OBJ_HAS_STRING 0x20
+#define OBJ_HAS_TABLE  0x08
 
-/* ---- encode -------------------------------------------------------------- */
-/* enc_state: dynamic byte buffer + table ref map ("addr" -> id) stored in a
- * Lua table pinned at absolute index REF_TABLE on the encoder's stack. */
+#define OBJ_MAX_U30    4294967296.0   /* exclusive upper bound (2^32) */
+#define OBJ_MAX_DEPTH  1000
+
+/* ------------------------------------------------------------------ */
+/* growable byte writer                                               */
+/* ------------------------------------------------------------------ */
 typedef struct {
-    BYTEARRAY *out;      /* owned externally (GC-guarded userdata) */
-    int      ref_idx;    /* absolute stack index of the ref-map table on L */
-    uint32_t next_id;    /* next fresh refid (starts at 1) */
-} enc_state_t;
+    uint8_t *buf;
+    size_t   len;
+    size_t   cap;
+} wbuf;
 
-static void append_byte(enc_state_t *e, unsigned char b) {
-    bytearray_writebuffer(e->out, &b, 1);
-}
-static void append_le(enc_state_t *e, uint64_t v, int n) {
-    unsigned char buf[8];
-    for (int i = 0; i < n; i++) buf[i] = (v >> (i * 8)) & 0xff;
-    bytearray_writebuffer(e->out, buf, (size_t)n);
-}
-
-static void encode_value(lua_State *L, int val_idx, enc_state_t *e);
-
-static void encode_int(enc_state_t *e, lua_Integer v) {
-    if (v >= -0x80 && v <= 0x7f) {
-        append_byte(e, T_INT8);
-        append_le(e, (uint64_t)(uint8_t)(int8_t)v, 1);
-    } else if (v >= -0x8000 && v <= 0x7fff) {
-        append_byte(e, T_INT16);
-        append_le(e, (uint64_t)(uint16_t)(int16_t)v, 2);
-    } else if (v >= -0x80000000LL && v <= 0x7fffffffLL) {
-        append_byte(e, T_INT32);
-        append_le(e, (uint64_t)(uint32_t)(int32_t)v, 4);
-    } else {
-        append_byte(e, T_INT64);
-        append_le(e, (uint64_t)v, 8);
+static void wb_grow(wbuf *w, size_t extra)
+{
+    if (w->len + extra <= w->cap) return;
+    if (w->cap == 0) w->cap = 64;
+    while (w->cap < w->len + extra) {
+        if (w->cap > (size_t)-1 / 2) { w->cap = w->len + extra; break; }
+        w->cap *= 2;
     }
+    uint8_t *nb = (uint8_t *)realloc(w->buf, w->cap);
+    if (!nb) { w->cap = 0; return; }
+    w->buf = nb;
 }
 
-static void encode_string(enc_state_t *e, const char *s, size_t n) {
-    if (n <= 0xff) {
-        append_byte(e, T_STR8);  append_le(e, n, 1);
-    } else if (n <= 0xffff) {
-        append_byte(e, T_STR16); append_le(e, n, 2);
-    } else {
-        append_byte(e, T_STR32); append_le(e, n, 4);
+static void wb_byte(wbuf *w, uint8_t b)
+{
+    wb_grow(w, 1);
+    if (w->cap < w->len + 1) return;
+    w->buf[w->len++] = b;
+}
+
+static void wb_raw(wbuf *w, const void *p, size_t n)
+{
+    if (n == 0) return;
+    wb_grow(w, n);
+    if (w->cap < w->len + n) return;
+    memcpy(w->buf + w->len, p, n);
+    w->len += n;
+}
+
+static void wb_u30(wbuf *w, uint32_t v)
+{
+    while (v >= 0x80) { wb_byte(w, (uint8_t)((v & 0x7f) | 0x80)); v >>= 7; }
+    wb_byte(w, (uint8_t)v);
+}
+
+static void wb_d64(wbuf *w, double d)
+{
+    union { double d; uint64_t u; } c;
+    c.d = d;
+    for (int i = 0; i < 8; ++i) wb_byte(w, (uint8_t)(c.u >> (i * 8)));
+}
+
+static void wb_string(wbuf *w, const char *s, size_t n)
+{
+    wb_u30(w, (uint32_t)n);
+    wb_raw(w, s, n);
+}
+
+/* ------------------------------------------------------------------ */
+/* reader                                                             */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    const uint8_t *p;
+    size_t         len;
+    size_t         pos;
+} rbuf;
+
+static int rb_byte(rbuf *r, uint8_t *v)
+{
+    if (r->pos >= r->len) return 0;
+    *v = r->p[r->pos++];
+    return 1;
+}
+
+static int rb_u30(rbuf *r, uint32_t *v)
+{
+    uint32_t x = 0;
+    int shift = 0;
+    uint8_t b;
+    do {
+        if (shift > 28 || !rb_byte(r, &b)) return 0;
+        x |= (uint32_t)(b & 0x7f) << shift;
+        shift += 7;
+    } while (b & 0x80);
+    *v = x;
+    return 1;
+}
+
+static int rb_d64(rbuf *r, double *v)
+{
+    uint64_t x = 0;
+    for (int i = 0; i < 8; ++i) {
+        uint8_t b;
+        if (!rb_byte(r, &b)) return 0;
+        x |= (uint64_t)b << (i * 8);
     }
-    bytearray_writebuffer(e->out, s, n);
+    union { double d; uint64_t u; } c;
+    c.u = x;
+    *v = c.d;
+    return 1;
 }
 
-/* Assign or look up the refid for the table at val_idx.
- * Returns id (>0) and *existed=1 if it was already seen. */
-static uint32_t table_ref_id(lua_State *L, int val_idx, enc_state_t *e,
-                             int *existed) {
-    /* key = lightuserdata of the table pointer (const void*) */
-    lua_pushlightuserdata(L, (void *)lua_topointer(L, val_idx));
-    lua_rawget(L, e->ref_idx);
+static size_t rb_rem(const rbuf *r) { return r->len - r->pos; }
+
+/* ------------------------------------------------------------------ */
+/* collection pass (mirrors v1 packer)                                */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int tables, numbers, u30s, strings;          /* lists */
+    int table_map, number_map, u30_map, string_map;
+    int n_tables, n_numbers, n_u30s, n_strings;
+    int depth;
+} pack_ctx;
+
+static void pack_ctx_init(lua_State *L, pack_ctx *c)
+{
+    memset(c, 0, sizeof(*c));
+    lua_newtable(L); c->tables     = lua_absindex(L, -1);
+    lua_newtable(L); c->numbers    = lua_absindex(L, -1);
+    lua_newtable(L); c->u30s       = lua_absindex(L, -1);
+    lua_newtable(L); c->strings    = lua_absindex(L, -1);
+    lua_newtable(L); c->number_map = lua_absindex(L, -1);
+    lua_newtable(L); c->u30_map    = lua_absindex(L, -1);
+    lua_newtable(L); c->string_map = lua_absindex(L, -1);
+    lua_newtable(L); c->table_map  = lua_absindex(L, -1);
+}
+
+static int obj_is_u30(lua_Number v)
+{
+    return isfinite((double)v) && floor((double)v) == (double)v
+        && v >= 0 && v < OBJ_MAX_U30;
+}
+
+static void pack_value(lua_State *L, pack_ctx *c, int idx);
+
+static void pack_add(lua_State *L, int map, int list, int *count, int idx)
+{
+    ++*count;
+    lua_pushvalue(L, idx);
+    lua_rawseti(L, list, *count);
+    lua_pushvalue(L, idx);
+    lua_pushinteger(L, *count);
+    lua_rawset(L, map);
+}
+
+static void pack_table(lua_State *L, pack_ctx *c, int idx)
+{
+    if (++c->depth > OBJ_MAX_DEPTH) {
+        luaL_error(L, "objectbuf: table nesting too deep (> %d)", OBJ_MAX_DEPTH);
+    }
+    if (!lua_checkstack(L, 8)) {
+        luaL_error(L, "objectbuf: cannot grow stack for nested table");
+    }
+    lua_pushvalue(L, idx);
+    lua_rawget(L, c->table_map);
     if (!lua_isnil(L, -1)) {
-        uint32_t id = (uint32_t)lua_tointeger(L, -1);
         lua_pop(L, 1);
-        *existed = 1;
-        return id;
-    }
-    lua_pop(L, 1);  /* pop nil */
-    uint32_t id = e->next_id++;
-    lua_pushlightuserdata(L, (void *)lua_topointer(L, val_idx));
-    lua_pushinteger(L, (lua_Integer)id);
-    lua_rawset(L, e->ref_idx);
-    *existed = 0;
-    return id;
-}
-
-static void encode_table(lua_State *L, int val_idx, enc_state_t *e) {
-    int existed = 0;
-    uint32_t id = table_ref_id(L, val_idx, e, &existed);
-    if (existed) {
-        append_byte(e, T_REF);
-        append_le(e, id, 4);
+        c->depth--;
         return;
     }
-    /* count contiguous 1..arr_n and collect map keys */
-    uint32_t arr_n = 0;
-    while (1) {
-        lua_rawgeti(L, val_idx, (lua_Integer)(arr_n + 1));
-        int is_nil = lua_isnil(L, -1);
-        lua_pop(L, 1);
-        if (is_nil) break;
-        arr_n++;
-    }
-    /* first pass to count map entries */
-    uint32_t map_n = 0;
+    lua_pop(L, 1);
+
+    pack_add(L, c->table_map, c->tables, &c->n_tables, idx);
+
     lua_pushnil(L);
-    while (lua_next(L, val_idx) != 0) {
-        int is_arr_slot = 0;
-        if (lua_type(L, -2) == LUA_TNUMBER) {
-            /* integer key in 1..arr_n counts as array */
-            lua_Number kn = lua_tonumber(L, -2);
-            lua_Integer ki = (lua_Integer)kn;
-            if ((lua_Number)ki == kn && ki >= 1 && (uint32_t)ki <= arr_n) {
-                is_arr_slot = 1;
-            }
-        }
-        if (!is_arr_slot) map_n++;
+    while (lua_next(L, idx) != 0) {
+        pack_value(L, c, lua_gettop(L) - 1);
+        pack_value(L, c, lua_gettop(L));
         lua_pop(L, 1);
     }
-    append_byte(e, T_TABLE);
-    append_le(e, arr_n, 4);
-    append_le(e, map_n, 4);
-    /* array part */
-    for (uint32_t i = 1; i <= arr_n; i++) {
-        lua_rawgeti(L, val_idx, (lua_Integer)i);
-        encode_value(L, lua_gettop(L), e);
-        lua_pop(L, 1);
-    }
-    /* map part: reiterate and skip array slots */
-    lua_pushnil(L);
-    while (lua_next(L, val_idx) != 0) {
-        int is_arr_slot = 0;
-        if (lua_type(L, -2) == LUA_TNUMBER) {
-            lua_Number kn = lua_tonumber(L, -2);
-            lua_Integer ki = (lua_Integer)kn;
-            if ((lua_Number)ki == kn && ki >= 1 && (uint32_t)ki <= arr_n) {
-                is_arr_slot = 1;
-            }
-        }
-        if (is_arr_slot) { lua_pop(L, 1); continue; }
-        /* key at -2, value at -1 */
-        encode_value(L, lua_gettop(L) - 1, e);
-        encode_value(L, lua_gettop(L),     e);
-        lua_pop(L, 1);
-    }
+    c->depth--;
 }
 
-static void encode_value(lua_State *L, int val_idx, enc_state_t *e) {
-    int t = lua_type(L, val_idx);
-    if (t == LUA_TNIL) {
-        append_byte(e, T_NIL);
-    } else if (t == LUA_TBOOLEAN) {
-        append_byte(e, lua_toboolean(L, val_idx) ? T_TRUE : T_FALSE);
-    } else if (t == LUA_TNUMBER) {
-#if LUA_VERSION_NUM >= 503
-        if (lua_isinteger(L, val_idx)) {
-            encode_int(e, lua_tointeger(L, val_idx));
-        } else {
-            append_byte(e, T_FLOAT);
-            union { double d; uint64_t u; } cv;
-            cv.d = lua_tonumber(L, val_idx);
-            append_le(e, cv.u, 8);
-        }
-#else
-        double d = lua_tonumber(L, val_idx);
-        lua_Integer i = (lua_Integer)d;
-        if ((double)i == d) {
-            encode_int(e, i);
-        } else {
-            append_byte(e, T_FLOAT);
-            union { double d; uint64_t u; } cv;
-            cv.d = d;
-            append_le(e, cv.u, 8);
-        }
-#endif
-    } else if (t == LUA_TSTRING) {
-        size_t n = 0;
-        const char *s = lua_tolstring(L, val_idx, &n);
-        encode_string(e, s, n);
-    } else if (t == LUA_TTABLE) {
-        encode_table(L, val_idx, e);
-    } else {
-        luaL_error(L, "objectbuf: cannot serialise Lua %s",
-                   lua_typename(L, t));
-    }
+static void pack_number(lua_State *L, pack_ctx *c, int idx)
+{
+    lua_Number v = lua_tonumber(L, idx);
+    int u30 = obj_is_u30(v);
+    int map = u30 ? c->u30_map : c->number_map;
+    lua_pushvalue(L, idx);
+    lua_rawget(L, map);
+    if (!lua_isnil(L, -1)) { lua_pop(L, 1); return; }
+    lua_pop(L, 1);
+    if (u30) pack_add(L, c->u30_map, c->u30s, &c->n_u30s, idx);
+    else     pack_add(L, c->number_map, c->numbers, &c->n_numbers, idx);
 }
 
-/* GC helper: a userdata that owns the encode bytearray. If encode_value
- * raises via luaL_error, the ownership survives on the stack until Lua GC
- * runs __gc and reclaims the buffer. */
-static int enc_gc(lua_State *L) {
-    BYTEARRAY *ba = (BYTEARRAY *)luaL_checkudata(L, 1, "fan.objectbuf.enc");
-    if (ba->buffer) bytearray_dealloc(ba);
-    return 0;
+static void pack_string(lua_State *L, pack_ctx *c, int idx)
+{
+    lua_pushvalue(L, idx);
+    lua_rawget(L, c->string_map);
+    if (!lua_isnil(L, -1)) { lua_pop(L, 1); return; }
+    lua_pop(L, 1);
+    pack_add(L, c->string_map, c->strings, &c->n_strings, idx);
 }
 
-static int l_encode(lua_State *L) {
-    luaL_checkany(L, 1);
-    lua_settop(L, 1);            /* value at slot 1 */
-    lua_newtable(L);             /* ref map at slot 2 */
-
-    /* stash the bytearray in a GC-guarded userdata at slot 3 */
-    BYTEARRAY *guard = (BYTEARRAY *)lua_newuserdata(L, sizeof(BYTEARRAY));
-    memset(guard, 0, sizeof(*guard));
-    if (luaL_newmetatable(L, "fan.objectbuf.enc")) {
-        lua_pushcfunction(L, enc_gc);
-        lua_setfield(L, -2, "__gc");
-    }
-    lua_setmetatable(L, -2);
-    if (!bytearray_alloc(guard, 64)) {
-        return luaL_error(L, "objectbuf.encode: OOM");
-    }
-
-    enc_state_t e;
-    e.out = guard;                  /* share the guarded bytearray directly */
-    e.ref_idx = 2;
-    e.next_id = 1;
-    encode_value(L, 1, &e);
-    lua_pushlstring(L, (const char *)guard->buffer, guard->length);
-    bytearray_dealloc(guard);       /* free now; enc_gc becomes a no-op */
-    memset(guard, 0, sizeof(*guard));
-    return 1;
-}
-
-/* ---- decode -------------------------------------------------------------- */
-/* dec_state: source bytes + read cursor + refs table pinned at ref_idx.
- * refs[i] holds table objects registered at decode time (1-based). */
-typedef struct {
-    const unsigned char *s;
-    size_t   n;
-    size_t   pos;
-    int      ref_idx;   /* absolute Lua stack index of refs table */
-    uint32_t refs_len;  /* current count of registered tables */
-} dec_state_t;
-
-static const unsigned char *dec_read(dec_state_t *d, size_t n) {
-    if (d->pos + n > d->n) return NULL;
-    const unsigned char *p = d->s + d->pos;
-    d->pos += n;
-    return p;
-}
-
-static uint64_t dec_le(const unsigned char *p, int n) {
-    uint64_t v = 0;
-    for (int i = 0; i < n; i++) v |= (uint64_t)p[i] << (i * 8);
-    return v;
-}
-
-static int decode_value(lua_State *L, dec_state_t *d);
-
-static int decode_table(lua_State *L, dec_state_t *d) {
-    const unsigned char *ha = dec_read(d, 8);
-    if (!ha) return luaL_error(L, "objectbuf.decode: eof in table header");
-    uint32_t arr_n = (uint32_t)dec_le(ha,     4);
-    uint32_t map_n = (uint32_t)dec_le(ha + 4, 4);
-    lua_newtable(L);
-    /* register BEFORE descending so self-references resolve to same table */
-    d->refs_len++;
-    lua_pushvalue(L, -1);
-    lua_rawseti(L, d->ref_idx, (lua_Integer)d->refs_len);
-
-    for (uint32_t i = 1; i <= arr_n; i++) {
-        decode_value(L, d);
-        lua_rawseti(L, -2, (lua_Integer)i);
-    }
-    for (uint32_t i = 0; i < map_n; i++) {
-        decode_value(L, d);    /* key */
-        decode_value(L, d);    /* value */
-        lua_rawset(L, -3);
-    }
-    return 1;
-}
-
-static int decode_value(lua_State *L, dec_state_t *d) {
-    const unsigned char *p = dec_read(d, 1);
-    if (!p) return luaL_error(L, "objectbuf.decode: unexpected eof");
-    unsigned char tag = p[0];
-    switch (tag) {
-    case T_NIL:   lua_pushnil(L); return 1;
-    case T_FALSE: lua_pushboolean(L, 0); return 1;
-    case T_TRUE:  lua_pushboolean(L, 1); return 1;
-    case T_INT8: {
-        p = dec_read(d, 1);
-        if (!p) return luaL_error(L, "objectbuf.decode: eof INT8");
-        lua_pushinteger(L, (lua_Integer)(int8_t)p[0]);
-        return 1;
-    }
-    case T_INT16: {
-        p = dec_read(d, 2);
-        if (!p) return luaL_error(L, "objectbuf.decode: eof INT16");
-        lua_pushinteger(L, (lua_Integer)(int16_t)dec_le(p, 2));
-        return 1;
-    }
-    case T_INT32: {
-        p = dec_read(d, 4);
-        if (!p) return luaL_error(L, "objectbuf.decode: eof INT32");
-        lua_pushinteger(L, (lua_Integer)(int32_t)dec_le(p, 4));
-        return 1;
-    }
-    case T_INT64: {
-        p = dec_read(d, 8);
-        if (!p) return luaL_error(L, "objectbuf.decode: eof INT64");
-        lua_pushinteger(L, (lua_Integer)(int64_t)dec_le(p, 8));
-        return 1;
-    }
-    case T_FLOAT: {
-        p = dec_read(d, 8);
-        if (!p) return luaL_error(L, "objectbuf.decode: eof FLOAT");
-        union { double d; uint64_t u; } cv;
-        cv.u = dec_le(p, 8);
-        lua_pushnumber(L, cv.d);
-        return 1;
-    }
-    case T_STR8:
-    case T_STR16:
-    case T_STR32: {
-        int nb = (tag == T_STR8) ? 1 : (tag == T_STR16) ? 2 : 4;
-        const unsigned char *lp = dec_read(d, nb);
-        if (!lp) return luaL_error(L, "objectbuf.decode: eof STR length");
-        uint32_t len = (uint32_t)dec_le(lp, nb);
-        const unsigned char *sp = dec_read(d, len);
-        if (!sp && len > 0) return luaL_error(L, "objectbuf.decode: eof STR body");
-        lua_pushlstring(L, (const char *)(sp ? sp : (const unsigned char *)""),
-                        (size_t)len);
-        return 1;
-    }
-    case T_TABLE:
-        return decode_table(L, d);
-    case T_REF: {
-        p = dec_read(d, 4);
-        if (!p) return luaL_error(L, "objectbuf.decode: eof REF id");
-        uint32_t id = (uint32_t)dec_le(p, 4);
-        if (id < 1 || id > d->refs_len)
-            return luaL_error(L, "objectbuf.decode: bad back-reference %d", (int)id);
-        lua_rawgeti(L, d->ref_idx, (lua_Integer)id);
-        return 1;
-    }
+static void pack_value(lua_State *L, pack_ctx *c, int idx)
+{
+    switch (lua_type(L, idx)) {
+    case LUA_TTABLE:  pack_table(L, c, idx);  break;
+    case LUA_TNUMBER: pack_number(L, c, idx); break;
+    case LUA_TSTRING: pack_string(L, c, idx); break;
+    case LUA_TBOOLEAN:
+    case LUA_TNIL:
+        break;
     default:
-        return luaL_error(L, "objectbuf.decode: unknown tag %d", (int)tag);
+        luaL_error(L, "objectbuf: cannot serialise Lua %s",
+                   lua_typename(L, lua_type(L, idx)));
     }
 }
 
-static int l_decode(lua_State *L) {
-    size_t n = 0;
-    const char *s = luaL_checklstring(L, 1, &n);
-    lua_settop(L, 1);
-    lua_newtable(L);            /* refs table at slot 2 */
-    dec_state_t d;
-    d.s = (const unsigned char *)s;
-    d.n = n;
-    d.pos = 0;
-    d.ref_idx = 2;
-    d.refs_len = 0;
+/* ------------------------------------------------------------------ */
+/* encode                                                             */
+/* ------------------------------------------------------------------ */
+static int resolve_ref(lua_State *L, int sym_map, int index_map, int value_idx)
+{
+    if (sym_map) {
+        lua_pushvalue(L, value_idx);
+        lua_rawget(L, sym_map);
+        if (!lua_isnil(L, -1)) {
+            int r = (int)lua_tointeger(L, -1);
+            lua_pop(L, 1);
+            return r;
+        }
+        lua_pop(L, 1);
+    }
+    lua_pushvalue(L, value_idx);
+    lua_rawget(L, index_map);
+    if (lua_isnil(L, -1)) { lua_pop(L, 1); return -1; }
+    int r = (int)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    return r;
+}
 
-    /* run under pcall so we can convert errors into (nil, err) return */
-    lua_pushcfunction(L, (lua_CFunction)decode_value);
-    lua_pushlightuserdata(L, &d);
-    /* We cannot pcall a Lua-visible C function that takes a pointer;
-     * do the pcall via a small closure. Instead: run inline, catching
-     * errors via lua_pcall over an anonymous wrapper. */
+static int l_encode(lua_State *L)
+{
+    if (lua_isnoneornil(L, 1)) return luaL_error(L, "no argument.");
+    int base = lua_gettop(L);
+
+    if (lua_isboolean(L, 1)) {
+        lua_pushlstring(L, lua_toboolean(L, 1) ? "\x01" : "\x00", 1);
+        return 1;
+    }
+
+    int sym = lua_istable(L, 2) ? 2 : 0;
+
+    pack_ctx c;
+    pack_ctx_init(L, &c);
+    pack_value(L, &c, 1);
+
+    int index = 2;
+    int sym_map = 0;
+    if (sym) {
+        lua_rawgeti(L, sym, 3);
+        if (!lua_isnumber(L, -1)) {
+            return luaL_error(L, "objectbuf: invalid symbol table (missing index).");
+        }
+        index = (int)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        if (index < 2) {
+            return luaL_error(L, "objectbuf: invalid symbol table (index too small).");
+        }
+        lua_rawgeti(L, sym, 1);
+        if (!lua_istable(L, -1)) {
+            return luaL_error(L, "objectbuf: invalid symbol table (missing map).");
+        }
+        sym_map = lua_absindex(L, -1);
+    }
+
+    lua_newtable(L);
+    int index_map = lua_absindex(L, -1);
+    lua_pushboolean(L, 0); lua_pushinteger(L, 1); lua_rawset(L, index_map);
+    lua_pushboolean(L, 1); lua_pushinteger(L, 2); lua_rawset(L, index_map);
+
+    wbuf out;
+    memset(&out, 0, sizeof(out));
+    wb_byte(&out, 0);                 /* flag placeholder */
+    int flag = 0;
+
+    /* numbers (non-u30) */
+    if (c.n_numbers > 0) {
+        wbuf sec; memset(&sec, 0, sizeof(sec));
+        uint32_t real = 0;
+        for (int i = 1; i <= c.n_numbers; ++i) {
+            lua_rawgeti(L, c.numbers, i);
+            int vtop = lua_gettop(L);
+            int skip = 0;
+            if (sym_map) {
+                lua_pushvalue(L, vtop);
+                lua_rawget(L, sym_map);
+                skip = !lua_isnil(L, -1);
+                lua_pop(L, 1);
+            }
+            if (!skip) {
+                wb_d64(&sec, lua_tonumber(L, vtop));
+                ++real;
+                lua_pushvalue(L, vtop);
+                lua_pushinteger(L, index + (int)real);
+                lua_rawset(L, index_map);
+            }
+            lua_pop(L, 1);
+        }
+        if (real > 0) {
+            flag |= OBJ_HAS_NUMBER;
+            wb_u30(&out, real);
+            wb_raw(&out, sec.buf, sec.len);
+            index += (int)real;
+        }
+        free(sec.buf);
+    }
+
+    /* u30 integers */
+    if (c.n_u30s > 0) {
+        wbuf sec; memset(&sec, 0, sizeof(sec));
+        uint32_t real = 0;
+        for (int i = 1; i <= c.n_u30s; ++i) {
+            lua_rawgeti(L, c.u30s, i);
+            int vtop = lua_gettop(L);
+            int skip = 0;
+            if (sym_map) {
+                lua_pushvalue(L, vtop);
+                lua_rawget(L, sym_map);
+                skip = !lua_isnil(L, -1);
+                lua_pop(L, 1);
+            }
+            if (!skip) {
+                wb_u30(&sec, (uint32_t)lua_tointeger(L, vtop));
+                ++real;
+                lua_pushvalue(L, vtop);
+                lua_pushinteger(L, index + (int)real);
+                lua_rawset(L, index_map);
+            }
+            lua_pop(L, 1);
+        }
+        if (real > 0) {
+            flag |= OBJ_HAS_U30;
+            wb_u30(&out, real);
+            wb_raw(&out, sec.buf, sec.len);
+            index += (int)real;
+        }
+        free(sec.buf);
+    }
+
+    /* strings */
+    if (c.n_strings > 0) {
+        wbuf sec; memset(&sec, 0, sizeof(sec));
+        uint32_t real = 0;
+        for (int i = 1; i <= c.n_strings; ++i) {
+            lua_rawgeti(L, c.strings, i);
+            int vtop = lua_gettop(L);
+            int skip = 0;
+            if (sym_map) {
+                lua_pushvalue(L, vtop);
+                lua_rawget(L, sym_map);
+                skip = !lua_isnil(L, -1);
+                lua_pop(L, 1);
+            }
+            if (!skip) {
+                size_t slen = 0;
+                const char *s = lua_tolstring(L, vtop, &slen);
+                wb_string(&sec, s, slen);
+                ++real;
+                lua_pushvalue(L, vtop);
+                lua_pushinteger(L, index + (int)real);
+                lua_rawset(L, index_map);
+            }
+            lua_pop(L, 1);
+        }
+        if (real > 0) {
+            flag |= OBJ_HAS_STRING;
+            wb_u30(&out, real);
+            wb_raw(&out, sec.buf, sec.len);
+            index += (int)real;
+        }
+        free(sec.buf);
+    }
+
+    /* tables */
+    if (c.n_tables > 0) {
+        flag |= OBJ_HAS_TABLE;
+        wb_u30(&out, (uint32_t)c.n_tables);
+        for (int i = 1; i <= c.n_tables; ++i) {
+            lua_rawgeti(L, c.tables, i);
+            lua_pushinteger(L, index + i);
+            lua_rawset(L, index_map);
+        }
+        for (int i = 1; i <= c.n_tables; ++i) {
+            lua_rawgeti(L, c.tables, i);
+            int tb = lua_gettop(L);
+
+            wbuf body; memset(&body, 0, sizeof(body));
+            uint32_t arr_n = 0;
+            for (;;) {
+                lua_rawgeti(L, tb, (lua_Integer)arr_n + 1);
+                if (lua_isnil(L, -1)) { lua_pop(L, 1); break; }
+                int r = resolve_ref(L, sym_map, index_map, lua_gettop(L));
+                lua_pop(L, 1);
+                wb_u30(&body, (uint32_t)r);
+                ++arr_n;
+            }
+            lua_pushnil(L);
+            while (lua_next(L, tb) != 0) {
+                int vidx = lua_gettop(L);
+                int kidx = vidx - 1;
+                int is_arr = 0;
+                if (lua_type(L, kidx) == LUA_TNUMBER) {
+                    lua_Number nk = lua_tonumber(L, kidx);
+                    lua_Integer ik = (lua_Integer)nk;
+                    if ((lua_Number)ik == nk && ik >= 1 && (uint32_t)ik <= arr_n) {
+                        is_arr = 1;
+                    }
+                }
+                if (!is_arr) {
+                    int kr = resolve_ref(L, sym_map, index_map, kidx);
+                    int vr = resolve_ref(L, sym_map, index_map, vidx);
+                    wb_u30(&body, (uint32_t)kr);
+                    wb_u30(&body, (uint32_t)vr);
+                }
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+
+            wbuf d2; memset(&d2, 0, sizeof(d2));
+            wb_u30(&d2, arr_n);
+            wb_u30(&out, (uint32_t)(d2.len + body.len));
+            wb_raw(&out, d2.buf, d2.len);
+            wb_raw(&out, body.buf, body.len);
+            free(d2.buf);
+            free(body.buf);
+        }
+    }
+
+    /* scalar root fully resolved into the symbol table leaves flag at 0 */
+    if (flag == 0) {
+        int t = lua_type(L, 1);
+        if (t == LUA_TNUMBER) {
+            lua_Number v = lua_tonumber(L, 1);
+            if (obj_is_u30(v)) {
+                flag |= OBJ_HAS_U30;
+                wb_u30(&out, 1);
+                wb_u30(&out, (uint32_t)lua_tointeger(L, 1));
+            } else {
+                flag |= OBJ_HAS_NUMBER;
+                wb_u30(&out, 1);
+                wb_d64(&out, (double)v);
+            }
+        } else if (t == LUA_TSTRING) {
+            size_t slen = 0;
+            const char *s = lua_tolstring(L, 1, &slen);
+            flag |= OBJ_HAS_STRING;
+            wb_u30(&out, 1);
+            wb_string(&out, s, slen);
+        }
+    }
+
+    if (out.buf == NULL) {
+        lua_settop(L, base);
+        return luaL_error(L, "objectbuf: out of memory");
+    }
+    out.buf[0] = (uint8_t)flag;
+    lua_pushlstring(L, (const char *)out.buf, out.len);
+    free(out.buf);
+
+    lua_replace(L, base + 1);
+    lua_settop(L, base + 1);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* decode                                                             */
+/* ------------------------------------------------------------------ */
+static int push_ref(lua_State *L, int vk, int rev, uint32_t idx)
+{
+    if (vk) {
+        lua_rawgeti(L, vk, (lua_Integer)idx);
+        if (!lua_isnil(L, -1)) return 1;
+        lua_pop(L, 1);
+    }
+    lua_rawgeti(L, rev, (lua_Integer)idx);
+    if (lua_isnil(L, -1)) { lua_pop(L, 1); return 0; }
+    return 1;
+}
+
+static int l_decode(lua_State *L)
+{
+    size_t n = 0;
+    const char *data = luaL_checklstring(L, 1, &n);
+    int sym = lua_istable(L, 2) ? 2 : 0;
+
+    rbuf r = { (const uint8_t *)data, n, 0 };
+    uint8_t flag;
+    if (!rb_byte(&r, &flag)) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "decode failed, empty input.");
+        return 2;
+    }
+    if (flag == 0) { lua_pushboolean(L, 0); return 1; }
+    if (flag == 1) { lua_pushboolean(L, 1); return 1; }
+
+    lua_newtable(L);
+    int rev = lua_absindex(L, -1);
+    uint32_t index = 2;
+    int vk = 0;
+
+    if (sym) {
+        lua_rawgeti(L, sym, 3);
+        if (!lua_isnumber(L, -1)) {
+            lua_pop(L, 1);
+            lua_pushnil(L);
+            lua_pushliteral(L, "decode failed, invalid symbol table (missing index).");
+            return 2;
+        }
+        index = (uint32_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_rawgeti(L, sym, 2);
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            lua_pushnil(L);
+            lua_pushliteral(L, "decode failed, invalid symbol table (missing map).");
+            return 2;
+        }
+        vk = lua_absindex(L, -1);
+    }
+
+    lua_pushboolean(L, 0); lua_rawseti(L, rev, 1);
+    lua_pushboolean(L, 1); lua_rawseti(L, rev, 2);
+
+    uint32_t last_top = index + 1;
+
+    if (flag & OBJ_HAS_NUMBER) {
+        uint32_t count;
+        if (!rb_u30(&r, &count)) goto malformed;
+        last_top = index + 1;
+        for (uint32_t i = 0; i < count; ++i) {
+            double v;
+            if (!rb_d64(&r, &v)) goto malformed;
+            lua_pushnumber(L, v);
+            lua_rawseti(L, rev, ++index);
+        }
+    }
+
+    if (flag & OBJ_HAS_U30) {
+        uint32_t count;
+        if (!rb_u30(&r, &count)) goto malformed;
+        last_top = index + 1;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t v;
+            if (!rb_u30(&r, &v)) goto malformed;
+            lua_pushinteger(L, (lua_Integer)v);
+            lua_rawseti(L, rev, ++index);
+        }
+    }
+
+    if (flag & OBJ_HAS_STRING) {
+        uint32_t count;
+        if (!rb_u30(&r, &count)) goto malformed;
+        last_top = index + 1;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t slen;
+            if (!rb_u30(&r, &slen) || slen > rb_rem(&r)) goto malformed;
+            lua_pushlstring(L, (const char *)(r.p + r.pos), slen);
+            r.pos += slen;
+            lua_rawseti(L, rev, ++index);
+        }
+    }
+
+    if (flag & OBJ_HAS_TABLE) {
+        uint32_t count;
+        if (!rb_u30(&r, &count) || count > rb_rem(&r)) goto malformed;
+        last_top = index + 1;
+        for (uint32_t i = 1; i <= count; ++i) {
+            lua_newtable(L);
+            lua_rawseti(L, rev, index + i);
+        }
+        index += count;
+        for (uint32_t i = 1; i <= count; ++i) {
+            uint32_t blen;
+            if (!rb_u30(&r, &blen) || blen > rb_rem(&r)) goto malformed;
+            rbuf b = { r.p + r.pos, blen, 0 };
+            r.pos += blen;
+
+            lua_rawgeti(L, rev, index - count + i);
+            uint32_t arr_n;
+            if (!rb_u30(&b, &arr_n) || arr_n > rb_rem(&b)) goto malformed;
+            for (uint32_t j = 1; j <= arr_n; ++j) {
+                uint32_t vi;
+                if (!rb_u30(&b, &vi)) goto malformed;
+                if (!push_ref(L, vk, rev, vi)) goto malformed;
+                lua_rawseti(L, -2, j);
+            }
+            while (b.pos < b.len) {
+                uint32_t ki, vi;
+                if (!rb_u30(&b, &ki) || !rb_u30(&b, &vi)) goto malformed;
+                if (!push_ref(L, vk, rev, ki)) goto malformed;
+                if (!push_ref(L, vk, rev, vi)) goto malformed;
+                lua_rawset(L, -3);
+            }
+            lua_pop(L, 1);
+        }
+    }
+
+    if (!push_ref(L, vk, rev, last_top)) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "decode failed, root missing.");
+        return 2;
+    }
+    lua_replace(L, 1);
+    lua_settop(L, 1);
+    return 1;
+
+malformed:
+    lua_settop(L, 0);
+    lua_pushnil(L);
+    lua_pushliteral(L, "decode failed, malformed objectbuf stream.");
+    return 2;
+}
+
+/* ------------------------------------------------------------------ */
+/* symbol                                                             */
+/* ------------------------------------------------------------------ */
+static void sort_list(lua_State *L, int list)
+{
+    lua_getglobal(L, "table");
+    lua_getfield(L, -1, "sort");
+    lua_pushvalue(L, list);
+    lua_call(L, 1, 0);
+    lua_pop(L, 1);
+}
+
+static int l_symbol(lua_State *L)
+{
+    if (lua_isnoneornil(L, 1)) return luaL_error(L, "no argument.");
+    int base = lua_gettop(L);
+
+    pack_ctx c;
+    pack_ctx_init(L, &c);
+    pack_value(L, &c, 1);
+
+    sort_list(L, c.strings);
+    sort_list(L, c.numbers);
+    sort_list(L, c.u30s);
+
+    lua_newtable(L); int map = lua_absindex(L, -1);
+    lua_newtable(L); int vk  = lua_absindex(L, -1);
+    lua_pushboolean(L, 0); lua_pushinteger(L, 1); lua_rawset(L, map);
+    lua_pushboolean(L, 1); lua_pushinteger(L, 2); lua_rawset(L, map);
+
+    int index = 2;
+    int lists[3] = { c.strings, c.numbers, c.u30s };
+    for (int k = 0; k < 3; ++k) {
+        size_t cnt = lua_rawlen(L, lists[k]);
+        for (size_t i = 1; i <= cnt; ++i) {
+            int ni = index + (int)i;
+            lua_rawgeti(L, lists[k], (lua_Integer)i);
+            lua_pushvalue(L, -1);
+            lua_pushinteger(L, ni);
+            lua_rawset(L, map);          /* map[value] = ni */
+            lua_pushvalue(L, -1);
+            lua_rawseti(L, vk, ni);      /* vk[ni] = value */
+            lua_pop(L, 1);
+        }
+        index += (int)cnt;
+    }
+
+    lua_newtable(L);
+    int sym = lua_absindex(L, -1);
+    lua_pushvalue(L, map); lua_rawseti(L, sym, 1);
+    lua_pushvalue(L, vk);  lua_rawseti(L, sym, 2);
+    lua_pushinteger(L, index); lua_rawseti(L, sym, 3);
+    lua_pushvalue(L, map); lua_setfield(L, sym, "map");
+    lua_pushvalue(L, vk);  lua_setfield(L, sym, "map_vk");
+    lua_pushinteger(L, index); lua_setfield(L, sym, "index");
+
+    lua_replace(L, base + 1);
+    lua_settop(L, base + 1);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* sample                                                             */
+/* ------------------------------------------------------------------ */
+static int cmp_count(lua_State *L)
+{
+    lua_getfield(L, 1, "count");
+    lua_Number a = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 2, "count");
+    lua_Number b = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_pushboolean(L, a > b);
+    return 1;
+}
+
+static void sample_count(lua_State *L, int counts, int list, int idx)
+{
+    lua_pushvalue(L, idx);
+    lua_rawget(L, counts);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        lua_pushvalue(L, idx); lua_setfield(L, -2, "key");
+        lua_pushinteger(L, 1); lua_setfield(L, -2, "count");
+        lua_pushvalue(L, -1);
+        lua_rawseti(L, list, (lua_Integer)lua_rawlen(L, list) + 1);
+        lua_pushvalue(L, idx);
+        lua_pushvalue(L, -2);
+        lua_rawset(L, counts);
+        lua_pop(L, 1);
+    } else {
+        lua_getfield(L, -1, "count");
+        lua_Integer cnt = lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_pushinteger(L, cnt + 1);
+        lua_setfield(L, -2, "count");
+        lua_pop(L, 1);
+    }
+}
+
+static void sample_walk(lua_State *L, int counts, int list, int idx, int depth)
+{
+    if (depth > OBJ_MAX_DEPTH) return;
+    if (lua_type(L, idx) != LUA_TTABLE) {
+        sample_count(L, counts, list, idx);
+        return;
+    }
+
+    lua_Integer total = 0;
+    for (;;) {
+        lua_rawgeti(L, idx, total + 1);
+        if (lua_isnil(L, -1)) { lua_pop(L, 1); break; }
+        total++;
+        sample_walk(L, counts, list, lua_gettop(L), depth + 1);
+        lua_pop(L, 1);
+    }
+
+    lua_pushnil(L);
+    while (lua_next(L, idx) != 0) {
+        int vidx = lua_gettop(L);
+        int kidx = vidx - 1;
+        int is_arr = 0;
+        if (lua_type(L, kidx) == LUA_TNUMBER) {
+            lua_Number nk = lua_tonumber(L, kidx);
+            lua_Integer ik = (lua_Integer)nk;
+            if ((lua_Number)ik == nk && ik >= 1 && ik <= total) is_arr = 1;
+        }
+        if (!is_arr) {
+            sample_walk(L, counts, list, kidx, depth + 1);
+            sample_walk(L, counts, list, vidx, depth + 1);
+        }
+        lua_pop(L, 1);
+    }
+}
+
+static int l_sample(lua_State *L)
+{
+    if (lua_isnoneornil(L, 1)) return luaL_error(L, "no argument.");
+    int limit = (int)luaL_optinteger(L, 2, 127);
+    if (limit < 0) limit = 0;
+    int base = lua_gettop(L);
+
+    lua_newtable(L); int counts = lua_absindex(L, -1);
+    lua_newtable(L); int list   = lua_absindex(L, -1);
+    sample_walk(L, counts, list, 1, 0);
+
+    lua_getglobal(L, "table");
+    lua_getfield(L, -1, "sort");
+    lua_pushvalue(L, list);
+    lua_pushcfunction(L, cmp_count);
+    lua_call(L, 2, 0);
+    lua_pop(L, 1);
+
+    lua_newtable(L);
+    int out = lua_absindex(L, -1);
+    int n = (int)lua_rawlen(L, list);
+    int take = n < limit ? n : limit;
+    for (int i = 1; i <= take; ++i) {
+        lua_rawgeti(L, list, i);
+        lua_getfield(L, -1, "key");
+        lua_rawseti(L, out, i);
+        lua_pop(L, 1);
+    }
+
+    lua_replace(L, base + 1);
+    lua_settop(L, base + 1);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* registration                                                       */
+/* ------------------------------------------------------------------ */
+void fan_objectbuf_register(lua_State *L)
+{
+    int fan = lua_gettop(L);   /* fan module table is on top */
+    lua_newtable(L);
+    int ob = lua_absindex(L, -1);
+
+    lua_pushcfunction(L, l_encode); lua_setfield(L, ob, "encode");
+    lua_pushcfunction(L, l_decode); lua_setfield(L, ob, "decode");
+    lua_pushcfunction(L, l_symbol); lua_setfield(L, ob, "symbol");
+    lua_pushcfunction(L, l_sample); lua_setfield(L, ob, "sample");
+
+    lua_pushvalue(L, ob);
+    lua_setfield(L, fan, "objectbuf");
+
+    lua_getglobal(L, "package");
+    lua_getfield(L, -1, "loaded");
+    lua_pushvalue(L, ob);
+    lua_setfield(L, -2, "fan.objectbuf");
     lua_pop(L, 2);
 
-    /* run decode_value inside a protected call: wrap it in a helper. */
-    /* Simpler: do it without pcall (any luaL_error will propagate as a raw
-     * Lua error), then wrap with a Lua-side pcall. Since we want (nil,err)
-     * on failure, we'll do pcall from Lua by exposing a raw variant and
-     * wrapping in a Lua trampoline at register time. Here we just call
-     * decode_value directly. */
-    decode_value(L, &d);        /* pushes 1 result */
-    if (d.pos != d.n) {
-        return luaL_error(L, "objectbuf.decode: trailing bytes at %d",
-                          (int)d.pos);
-    }
-    return 1;
-}
-
-/* Public wrapper that returns (value) on success or (nil, err) on failure.
- * We implement it as a Lua thin wrapper around raw_decode to keep pcall
- * semantics simple and portable. */
-static const char *DECODE_WRAPPER =
-    "local raw = ...\n"
-    "return function(s)\n"
-    "  local ok, v = pcall(raw, s)\n"
-    "  if ok then return v end\n"
-    "  return nil, v\n"
-    "end";
-
-void fan_objectbuf_register(lua_State *L) {
-    lua_newtable(L);
-    lua_pushcfunction(L, l_encode);
-    lua_setfield(L, -2, "encode");
-
-    /* create decode = wrapper(raw_decode) */
-    if (luaL_loadstring(L, DECODE_WRAPPER) != 0) {
-        luaL_error(L, "objectbuf: wrapper load failed: %s", lua_tostring(L, -1));
-    }
-    lua_pushcfunction(L, l_decode);
-    lua_call(L, 1, 1);
-    lua_setfield(L, -2, "decode");
-
-    lua_setfield(L, -2, "objectbuf");   /* fan.objectbuf = {...} */
+    lua_pop(L, 1);   /* pop ob, leave fan module table on top */
 }

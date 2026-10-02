@@ -62,6 +62,7 @@ not planning notes.
 - [M21 HTTPS CA pinning + TLS diagnostics](m21-tls-diagnostics.md) — pure-Lua HTTPS gains `cainfo` / `capath` per-request and module-scoped defaults; TLS / socket / DNS errors surface specific reasons (was opaque `"connection error"`); `SSL_CERT_FILE` / `SSL_CERT_DIR` env vars honoured for the process-wide default trust store.
 
 ## Codecs
+- [Codec — objectbuf and stream compatibility](codec-json-objectbuf-stream.md) — v1-compatible section/index objectbuf protocol with symbol/sample compression APIs, plus little-endian fan.stream wire compatibility.
 - [fan.json](json.md) — M9 + M16.3 + M23 native JSON codec.  RFC 8259
   numbers/escapes/UTF-8, sentinel-based null, explicit array/object
   markers, lossless `%.17g` IEEE 754 float round-trip, and (M23)

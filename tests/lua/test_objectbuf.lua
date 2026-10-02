@@ -11,14 +11,21 @@
     - decode rejects trailing garbage and unknown tags
 ]]
 local T = require("test_framework")
+local fan = require("fan")
 local buf = require("fan.objectbuf")
 
 local s = T.suite("fan.objectbuf (M5)")
 
+s:test("direct fan table uses the same v1-compatible codec", function()
+  T.eq(fan.objectbuf.encode(false), "\x00")
+  T.is_type(fan.objectbuf.symbol, "function")
+  T.is_type(fan.objectbuf.sample, "function")
+  T.is_nil(fan.objectbuf_v2)
+end)
+
 local function rt(v) return buf.decode(buf.encode(v)) end
 
 s:test("primitive round-trips", function()
-  T.eq(rt(nil),   nil)
   T.eq(rt(false), false)
   T.eq(rt(true),  true)
   T.eq(rt(0),     0)
@@ -110,14 +117,110 @@ s:test("unsupported types raise on encode", function()
   T.error_raised(function() buf.encode(coroutine.create(function() end)) end)
 end)
 
-s:test("decode surfaces error on trailing garbage", function()
-  local ok, err = buf.decode(buf.encode(42) .. "\0\0")
-  T.is_nil(ok); T.not_nil(err); T.truthy(err:find("trailing"))
+s:test("v1 wire golden vectors remain readable and writable", function()
+  local vectors = {
+    { value = false, wire = "\x00" },
+    { value = true,  wire = "\x01" },
+    { value = 42,    wire = "\x40\x01\x2a" },
+    { value = "x",   wire = "\x20\x01\x01x" },
+    { value = {},    wire = "\x08\x01\x01\x00" },
+  }
+  for _, tc in ipairs(vectors) do
+    local decoded = buf.decode(tc.wire)
+    if type(tc.value) == "table" then
+      T.is_type(decoded, "table")
+      T.eq(next(decoded), nil)
+    else
+      T.eq(decoded, tc.value)
+    end
+    T.eq(buf.encode(tc.value), tc.wire)
+  end
 end)
 
-s:test("decode surfaces error on unknown tag", function()
-  local ok, err = buf.decode("\xff")
-  T.is_nil(ok); T.not_nil(err); T.truthy(err:find("unknown tag"))
+s:test("v1 symbol and sample APIs preserve compression workflow", function()
+  T.is_type(buf.symbol, "function")
+  T.is_type(buf.sample, "function")
+  local value = { users = {} }
+  for i = 1, 40 do
+    value.users[i] = { status = "active", role = "member", region = "eu" }
+  end
+  local sym = buf.symbol(value)
+  T.is_type(sym, "table")
+  local plain = buf.encode(value)
+  local packed = buf.encode(value, sym)
+  T.truthy(#packed < #plain, "symbol table must reduce wire size")
+  local decoded = buf.decode(packed, sym)
+  T.eq(decoded.users[1].status, "active")
+  T.eq(decoded.users[40].region, "eu")
+  local sample = buf.sample(value, 2)
+  T.is_type(sample, "table")
+  T.truthy(#sample <= 2)
+end)
+
+s:test("binary-safe strings and UTF-8 round-trip", function()
+  local values = { "a\0b", "\0", "\255\254", "\1\2\3", "h\195\169llo\226\134\146" }
+  for _, v in ipairs(values) do
+    T.eq(rt(v), v)
+  end
+end)
+
+s:test("array holes leave a contiguous array part plus an explicit key", function()
+  local v = { 1, [3] = 3 }
+  local dec = rt(v)
+  T.eq(dec[1], 1)
+  T.is_nil(dec[2])
+  T.eq(dec[3], 3)
+end)
+
+s:test("tables may be used as keys and survive round-trip", function()
+  local key = { 1, 2 }
+  local v = { [key] = "x" }
+  local dec = buf.decode(buf.encode(v))
+  local found
+  for k, val in pairs(dec) do
+    if type(k) == "table" then found = val end
+  end
+  T.eq(found, "x")
+end)
+
+s:test("deeply nested tables round-trip", function()
+  local v = { leaf = 1 }
+  for _ = 1, 30 do v = { n = v } end
+  local dec = rt(v)
+  for _ = 1, 30 do dec = dec.n end
+  T.eq(dec.leaf, 1)
+end)
+
+s:test("decode rejects empty and truncated input", function()
+  local v1, e1 = buf.decode("")
+  T.is_nil(v1)
+  T.not_nil(e1)
+  local v2 = buf.decode("\x40")           -- U30 flag without a count
+  T.is_nil(v2)
+  local v3 = buf.decode("\x20\x01\x05ab") -- string length exceeds payload
+  T.is_nil(v3)
+end)
+
+s:test("sample ranks the most frequent values first", function()
+  local value = { "a", "a", "a", "b", "b", "c", 7, 7, 7, 7 }
+  local sample = buf.sample(value, 2)
+  T.eq(#sample, 2)
+  T.eq(sample[1], 7)
+  T.eq(sample[2], "a")
+end)
+
+s:test("extended integer boundaries round-trip as u30 or D64", function()
+  local values = {
+    2, 126, 127, 128, 129, 254, 255, 256, 257,
+    16382, 16383, 16384, 16385, 2097151, 2097152,
+    268435455, 268435456, 4294967294, 4294967295,
+    -1, -127, -128, -129, -255, -256, -32767, -32768, -32769,
+    -2147483647, -2147483648, -2147483649,
+    4294967296, 4294967297, 1099511627776, 9007199254740992,
+  }
+  for _, n in ipairs(values) do
+    T.eq(rt(n), n, "int " .. tostring(n))
+  end
 end)
 
 os.exit(T.run(s))
