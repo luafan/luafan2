@@ -70,6 +70,14 @@ static void dns_cb(int errcode, struct evutil_addrinfo *ai, void *arg) {
     dns_req_t *req = (dns_req_t *)arg;
     lua_State *co = req->co;
 
+    /* Teardown path: the owning Lua state is already invalid or closing.
+     * Release native DNS/request state, but never touch the coroutine stack. */
+    if (!g_dns_L) {
+        if (ai) evutil_freeaddrinfo(ai);
+        free(req);
+        return;
+    }
+
     int n = push_result(co, errcode, ai);
     if (ai) evutil_freeaddrinfo(ai);
 

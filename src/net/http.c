@@ -339,32 +339,27 @@ static void check_multi_info(void) {
         curl_multi_remove_handle(g_multi, easy);
         g_ncurrent--;
 
-        /* Materialise the response onto the parked coroutine's stack, then
-         * resume it. The coroutine's l_request frame will consume those
-         * values as the return of lua_yield. */
+        /* Materialise the response only while the owning Lua state is alive.
+         * During teardown, callbacks may still drain CURL messages after
+         * fan_http_clear_lua_state() has cleared g_main_L; `co` then belongs
+         * to a dead or closing state and must never be touched. */
         lua_State *co = r->co;
         int ref = r->co_ref;
+        int lua_alive = g_main_L != NULL;
         r->co = NULL;
         r->co_ref = LUA_NOREF;
+        int nrets = 0;
 
-        if (r->curl_result == CURLE_OK) {
+        if (lua_alive && r->curl_result == CURLE_OK) {
             long code = 0;
             curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &code);
 
-            /* Response table on `co`'s stack. */
-            lua_newtable(co);                                    /* resp = {} */
+            lua_newtable(co);
             lua_pushinteger(co, code);
             lua_setfield(co, -2, "status");
-            /* M16.4: v1 fan.http named this field `responseCode`; keep it
-             * as a permanent alias so legacy Luan code that reads
-             * resp.responseCode keeps working without an adapter layer. */
             lua_pushinteger(co, code);
             lua_setfield(co, -2, "responseCode");
 
-            /* Reason phrase + lower-cased headers table, both parsed from
-             * the raw wire buffer r->resp_headers. Extracted to M20.2
-             * helpers so cb_header can dispatch onheader with the same
-             * shape at header/body boundary. */
             size_t hlen = evbuffer_get_length(r->resp_headers);
             const char *hbuf = hlen ? (const char *)evbuffer_pullup(r->resp_headers, -1) : "";
             push_reason(co, hbuf, hlen);
@@ -372,17 +367,12 @@ static void check_multi_info(void) {
             push_headers_table(co, hbuf, hlen);
             lua_setfield(co, -2, "headers");
 
-            /* body — empty in streaming mode (buffered=false) since cb_write
-             * skipped accumulation. */
             size_t blen = evbuffer_get_length(r->resp_body);
             const char *bbuf = blen ? (const char *)evbuffer_pullup(r->resp_body, -1) : "";
             lua_pushlstring(co, bbuf, blen);
             lua_setfield(co, -2, "body");
-        } else {
-            /* Failed transfer: return nil, err. If a user callback aborted
-             * the transfer (onreceive / onheader returned false or raised),
-             * surface the callback's message instead of libcurl's generic
-             * CURLE_WRITE_ERROR text. */
+            nrets = 1;
+        } else if (lua_alive) {
             lua_pushnil(co);
             const char *msg;
             if (r->cancel_err) {
@@ -393,10 +383,8 @@ static void check_multi_info(void) {
                 msg = curl_easy_strerror(r->curl_result);
             }
             lua_pushstring(co, msg ? msg : "curl error");
+            nrets = 2;
         }
-
-        /* Number of return values on the coroutine's stack: 1 (resp) or 2 (nil,err). */
-        int nrets = r->curl_result == CURLE_OK ? 1 : 2;
 
         /* Release the per-request C resources BEFORE we resume the
          * coroutine. All response data the caller needs is already on
@@ -414,35 +402,29 @@ static void check_multi_info(void) {
         if (r->req_headers) { curl_slist_free_all(r->req_headers); r->req_headers = NULL; }
         if (r->body_copy)   { free(r->body_copy); r->body_copy = NULL; }
         r->body_len = 0;
-        /* M20.2: release the callback refs held via luaL_ref. Safe to do
-         * before wake because the callbacks have already fired for this
-         * request; no future WRITEFUNCTION / HEADERFUNCTION will run on
-         * this easy handle after multi_remove above. */
-        if (r->onreceive_ref != LUA_NOREF) {
+        /* Release callback refs only while the Lua registry is alive. */
+        if (lua_alive && r->onreceive_ref != LUA_NOREF) {
             luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onreceive_ref);
-            r->onreceive_ref = LUA_NOREF;
         }
-        if (r->onheader_ref != LUA_NOREF) {
+        r->onreceive_ref = LUA_NOREF;
+        if (lua_alive && r->onheader_ref != LUA_NOREF) {
             luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onheader_ref);
-            r->onheader_ref = LUA_NOREF;
         }
+        r->onheader_ref = LUA_NOREF;
         if (r->cancel_err) { free(r->cancel_err); r->cancel_err = NULL; }
         CURL_EASY_CLEANUP(easy, "multi_info_done");
         r->easy = NULL;
-        /* evbuffers can stay — l_req_gc frees them when the userdata dies,
-         * and they hold no dangling C-callback references (curl no longer
-         * points at them because the easy handle is gone). */
 
+        if (!lua_alive) {
+            /* Teardown path: all Lua-owned state is already invalid or
+             * closing. C/CURL resources are released, but no Lua API or
+             * coroutine wake is allowed. */
+            continue;
+        }
         if (ref == LUA_NOREF) {
-            /* Fast-path: l_request hasn't parked/yielded yet — the
-             * coroutine is still running the l_request C frame. Do NOT
-             * resume; the values are already on `co`'s stack, and
-             * l_request will notice r->done and return `nrets`. */
+            /* l_request has not parked yet; values are already on its stack. */
             (void)nrets;
         } else {
-            /* Parked case: wake resumes the coroutine so lua_yield in
-             * l_request returns `nrets` values to Lua. Safe now that r's
-             * curl-owned resources are already released. */
             fan_coro_wake(g_main_L, co, ref, nrets);
         }
     }

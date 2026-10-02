@@ -141,11 +141,22 @@ of the opaque pre-M21 `"connection error"`.  Full contract in
   bridge (onheader once, onreceive with buffered aggregate,
   buffered=false, cancellation via `false` / raised error, callback
   type validation).
+* `tests/c/unit/test_http_clear_lua_state.c` — teardown regression:
+  a pending C-backend request with `onreceive` completes after
+  `fan_http_clear_lua_state()` and must release C/CURL state without
+  touching the cleared Lua registry or coroutine. Runs under ASan.
 * `tests/lua/test_http_tls.lua` (M21) — pure-Lua HTTPS + CA
   pinning contract: correct-CA success, wrong-CA specific verify
   error, missing-file CTX diagnostic, `verify=false` bypass,
   `M.cainfo(path)` module setter, per-request override, closed
   port socket errno, bad DNS surface — 9 cases.
+
+The teardown regression test also exposed and guards the shared
+Lua-state lifecycle rule used by other event callbacks: after the clear
+hook, completion paths must do native cleanup without using Lua. The
+cross-module C regression coverage now includes pending HTTP, DNS, UDP,
+TCP receive, and MariaDB async operations after `fan_clear_lua_states()`;
+the arm64 ASan run covers all of these paths.
 
 Both suites run in-process against a `fan.tcp.bind` origin server
 built at the top of the file.
