@@ -32,9 +32,13 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__)
+#  include <sys/syscall.h>
+#endif
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -120,6 +124,15 @@ static void set_nonblock(int fd) {
 static void set_cloexec(int fd) {
     int fl = fcntl(fd, F_GETFD, 0);
     if (fl >= 0) fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
+
+static void close_inherited_fds(void) {
+#if defined(__linux__) && defined(SYS_close_range)
+    if (syscall(SYS_close_range, 3u, UINT_MAX, 0u) == 0) return;
+#endif
+    long max_fd = sysconf(_SC_OPEN_MAX);
+    if (max_fd < 0 || max_fd > 1048576) max_fd = 1024;
+    for (int fd = 3; fd < max_fd; fd++) close(fd);
 }
 
 static void queue_chunk(popen_t *p, int which, const char *data, size_t len) {
@@ -517,6 +530,7 @@ static int l_spawn(lua_State *L) {
             close(p_out[0]); close(p_out[1]);
             if (capture_stderr) { close(p_err[0]); close(p_err[1]); }
         }
+        close_inherited_fds();
         if (envp) {
 #if defined(__linux__) && defined(__GLIBC__)
             execvpe(argv[0], argv, envp);
