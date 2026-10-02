@@ -8,6 +8,8 @@ extern const test_suite_t websocket_suite;
 extern const test_suite_t tcp_clear_lua_state_suite;
 extern const test_suite_t tcp_pending_teardown_suite;
 extern const test_suite_t mariadb_pending_teardown_suite;
+extern const test_suite_t fifo_pending_teardown_suite;
+extern const test_suite_t httpd_pending_teardown_suite;
 extern const test_suite_t clear_lua_states_suite;
 extern const test_suite_t http_clear_lua_state_suite;
 extern const test_suite_t dns_clear_lua_state_suite;
@@ -21,6 +23,8 @@ int main(void) {
         tcp_clear_lua_state_suite,
         tcp_pending_teardown_suite,
         mariadb_pending_teardown_suite,
+        fifo_pending_teardown_suite,
+        httpd_pending_teardown_suite,
         clear_lua_states_suite,
         http_clear_lua_state_suite,
         dns_clear_lua_state_suite,

@@ -155,8 +155,11 @@ The teardown regression test also exposed and guards the shared
 Lua-state lifecycle rule used by other event callbacks: after the clear
 hook, completion paths must do native cleanup without using Lua. The
 cross-module C regression coverage now includes pending HTTP, DNS, UDP,
-TCP receive, and MariaDB async operations after `fan_clear_lua_states()`;
-the arm64 ASan run covers all of these paths.
+TCP receive, FIFO receive, HTTPD handler, and MariaDB async operations
+after `fan_clear_lua_states()`; the arm64 ASan run covers all of these
+paths. WebSocket handshake, frame, recv, and close behavior remains
+covered by `tests/lua/test_websocket.lua` (24 cases), including all
+server-side ownership paths.
 
 Both suites run in-process against a `fan.tcp.bind` origin server
 built at the top of the file.
