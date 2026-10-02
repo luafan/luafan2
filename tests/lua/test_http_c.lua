@@ -595,4 +595,61 @@ s:test("pick_backend selection rules", function()
   T.eq(http._pick_backend{}, "c")
 end)
 
+s:test("socket-context stress: mixed concurrent batches and callback cancellation", function()
+  local PORT = 25519
+  local server
+  local results = {}
+  local failures = {}
+  local total = 120
+  local completed = 0
+  run(function()
+    server = assert(httpd_lua.bind{
+      port = PORT,
+      onService = function(req, r)
+        local n = tonumber(req.params.n or "0") or 0
+        if n % 11 == 0 then fan.sleep(0.02) end
+        local body = "batch=" .. tostring(math.floor(n / 20)) .. ";n=" .. tostring(n)
+        r:reply(200,
+          { ["Content-Type"] = "text/plain", ["X-Req"] = tostring(n) }, body)
+      end,
+    })
+    for i = 1, total do
+      fan.spawn(function()
+        local n = i - 1
+        local chunks = 0
+        local response, err = http.request{
+          backend = "c",
+          url = BASE .. PORT .. "/stress",
+          query = { n = n },
+          onheader = function(h)
+            T.truthy(h.status == 200 or h.status == 204)
+          end,
+          onreceive = function()
+            chunks = chunks + 1
+            if n % 17 == 0 and chunks == 1 then return false end
+          end,
+        }
+        if n % 17 == 0 then
+          T.is_nil(response)
+          T.truthy(err and err:find("callback", 1, true))
+          failures[#failures + 1] = n
+        else
+          T.not_nil(response, err)
+          T.eq(response.headers["x-req"], tostring(n))
+          results[#results + 1] = response.body
+        end
+        completed = completed + 1
+        if completed == total then fan.loopbreak() end
+      end)
+    end
+    local deadline = fan.gettime() + 30
+    while completed < total and fan.gettime() < deadline do fan.sleep(0.01) end
+    if completed < total then error("socket stress timeout: " .. completed .. "/" .. total) end
+  end)
+  if server then server:close() end
+  T.eq(completed, total)
+  T.eq(#failures, 8)
+  T.eq(#results, total - #failures)
+end)
+
 os.exit(T.run(s))

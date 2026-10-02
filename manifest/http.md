@@ -140,7 +140,9 @@ of the opaque pre-M21 `"connection error"`.  Full contract in
   specifics, and the M20 streaming callbacks on the libcurl
   bridge (onheader once, onreceive with buffered aggregate,
   buffered=false, cancellation via `false` / raised error, callback
-  type validation).
+  type validation). It also includes a 120-request concurrent
+  socket-context stress test mixing delayed responses, callback
+  cancellation, repeated socket rearming, and completion cleanup.
 * `tests/c/unit/test_http_clear_lua_state.c` — teardown regression:
   a pending C-backend request with `onreceive` completes after
   `fan_http_clear_lua_state()` and must release C/CURL state without
