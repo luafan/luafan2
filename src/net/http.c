@@ -157,9 +157,12 @@ static void fan_curl_after_init(CURL *easy) {
  * so we don't need a separate registry ref for the ctx itself. */
 typedef struct req_ctx {
     CURL           *easy;
+    struct curl_slist *resolve;
     struct curl_slist *req_headers;   /* owned; freed at completion */
     char           *body_copy;        /* owned copy of POST body if any */
     size_t          body_len;
+    size_t          upload_pos;
+    curl_off_t      upload_len; /* -1: use body_len; otherwise v1 callback length */
     /* Response accumulators. Headers come line-by-line via HEADERFUNCTION and
      * are pushed into a Lua table at completion; body is a plain buffer. */
     struct evbuffer *resp_body;
@@ -193,7 +196,12 @@ typedef struct req_ctx {
      * to disk/application" string. */
     int             onreceive_ref;    /* LUA_NOREF when unset */
     int             onheader_ref;     /* LUA_NOREF when unset */
+    int             onprogress_ref;   /* LUA_NOREF when unset */
+    int             onsend_ref;       /* LUA_NOREF when unset */
+    int             oncomplete_ref;   /* LUA_NOREF when unset */
+    int             suppress_return;  /* oncomplete ran for this completion */
     int             buffered;         /* 0 -> don't accumulate resp_body */
+    int             empty_body_string;
     int             header_dispatched;
     char           *cancel_err;       /* strdup'd; freed at completion */
 } req_ctx_t;
@@ -215,6 +223,8 @@ static int    cb_socket(CURL *easy, curl_socket_t s, int what, void *up, void *s
 static int    cb_timer(CURLM *m, long timeout_ms, void *up);
 static size_t cb_write(char *ptr, size_t size, size_t nmemb, void *up);
 static size_t cb_header(char *ptr, size_t size, size_t nmemb, void *up);
+static int cb_progress(void *up, double dltotal, double dlnow, double ultotal, double ulnow);
+static int invoke_oncomplete(lua_State *L, req_ctx_t *r);
 /* M20.2 header-parse helpers (defined after check_multi_info, forward-decl'd
  * here so check_multi_info's completion tail can call them). */
 static void push_reason(lua_State *L, const char *hbuf, size_t hlen);
@@ -364,16 +374,61 @@ static void check_multi_info(void) {
             const char *hbuf = hlen ? (const char *)evbuffer_pullup(r->resp_headers, -1) : "";
             push_reason(co, hbuf, hlen);
             lua_setfield(co, -2, "reason");
+            lua_getfield(co, -1, "reason");
+            lua_setfield(co, -2, "responseMessage");
             push_headers_table(co, hbuf, hlen);
             lua_setfield(co, -2, "headers");
 
             size_t blen = evbuffer_get_length(r->resp_body);
-            const char *bbuf = blen ? (const char *)evbuffer_pullup(r->resp_body, -1) : "";
-            lua_pushlstring(co, bbuf, blen);
+            if (blen) {
+                const char *bbuf = (const char *)evbuffer_pullup(r->resp_body, -1);
+                lua_pushlstring(co, bbuf, blen);
+            } else if (r->empty_body_string) {
+                lua_pushliteral(co, "");
+            } else {
+                lua_pushnil(co);
+            }
             lua_setfield(co, -2, "body");
-            nrets = 1;
+
+            double timing = 0.0;
+            if (curl_easy_getinfo(easy, CURLINFO_NAMELOOKUP_TIME, &timing) == CURLE_OK) {
+                lua_pushnumber(co, timing); lua_setfield(co, -2, "dns_time");
+            }
+            if (curl_easy_getinfo(easy, CURLINFO_CONNECT_TIME, &timing) == CURLE_OK) {
+                lua_pushnumber(co, timing); lua_setfield(co, -2, "connect_time");
+            }
+            if (curl_easy_getinfo(easy, CURLINFO_APPCONNECT_TIME, &timing) == CURLE_OK) {
+                lua_pushnumber(co, timing); lua_setfield(co, -2, "appconnect_time");
+            }
+            if (curl_easy_getinfo(easy, CURLINFO_PRETRANSFER_TIME, &timing) == CURLE_OK) {
+                lua_pushnumber(co, timing); lua_setfield(co, -2, "pretransfer_time");
+            }
+            if (curl_easy_getinfo(easy, CURLINFO_STARTTRANSFER_TIME, &timing) == CURLE_OK) {
+                lua_pushnumber(co, timing); lua_setfield(co, -2, "starttransfer_time");
+            }
+            if (curl_easy_getinfo(easy, CURLINFO_TOTAL_TIME, &timing) == CURLE_OK) {
+                lua_pushnumber(co, timing); lua_setfield(co, -2, "total_time");
+            }
+
+            struct curl_slist *cookies = NULL;
+            if (curl_easy_getinfo(easy, CURLINFO_COOKIELIST, &cookies) == CURLE_OK && cookies) {
+                lua_newtable(co);
+                int ci = 1;
+                for (struct curl_slist *item = cookies; item; item = item->next) {
+                    lua_pushstring(co, item->data);
+                    lua_rawseti(co, -2, ci++);
+                }
+                lua_setfield(co, -2, "cookies");
+                curl_slist_free_all(cookies);
+            }
+            if (invoke_oncomplete(co, r)) {
+                lua_pop(co, 1);
+                r->suppress_return = 1;
+                nrets = 0;
+            } else {
+                nrets = 1;
+            }
         } else if (lua_alive) {
-            lua_pushnil(co);
             const char *msg;
             if (r->cancel_err) {
                 msg = r->cancel_err;
@@ -382,8 +437,23 @@ static void check_multi_info(void) {
             } else {
                 msg = curl_easy_strerror(r->curl_result);
             }
+            lua_newtable(co);
+            lua_pushinteger(co, 0);
+            lua_setfield(co, -2, "responseCode");
+            lua_pushinteger(co, 0);
+            lua_setfield(co, -2, "status");
+            lua_newtable(co);
+            lua_setfield(co, -2, "headers");
             lua_pushstring(co, msg ? msg : "curl error");
-            nrets = 2;
+            lua_setfield(co, -2, "error");
+            if (invoke_oncomplete(co, r)) {
+                lua_pop(co, 1);
+                r->suppress_return = 1;
+                nrets = 0;
+            } else {
+                lua_pushstring(co, msg ? msg : "curl error");
+                nrets = 2;
+            }
         }
 
         /* Release the per-request C resources BEFORE we resume the
@@ -400,17 +470,20 @@ static void check_multi_info(void) {
          * we hunted under coverage. Freeing here, NULL-ing the fields,
          * and only THEN waking, closes that window. */
         if (r->req_headers) { curl_slist_free_all(r->req_headers); r->req_headers = NULL; }
+        if (r->resolve) { curl_slist_free_all(r->resolve); r->resolve = NULL; }
         if (r->body_copy)   { free(r->body_copy); r->body_copy = NULL; }
         r->body_len = 0;
         /* Release callback refs only while the Lua registry is alive. */
-        if (lua_alive && r->onreceive_ref != LUA_NOREF) {
-            luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onreceive_ref);
-        }
+        if (lua_alive && r->onreceive_ref != LUA_NOREF) luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onreceive_ref);
         r->onreceive_ref = LUA_NOREF;
-        if (lua_alive && r->onheader_ref != LUA_NOREF) {
-            luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onheader_ref);
-        }
+        if (lua_alive && r->onheader_ref != LUA_NOREF) luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onheader_ref);
         r->onheader_ref = LUA_NOREF;
+        if (lua_alive && r->onprogress_ref != LUA_NOREF) luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onprogress_ref);
+        r->onprogress_ref = LUA_NOREF;
+        if (lua_alive && r->onsend_ref != LUA_NOREF) luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onsend_ref);
+        r->onsend_ref = LUA_NOREF;
+        if (lua_alive && r->oncomplete_ref != LUA_NOREF) luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->oncomplete_ref);
+        r->oncomplete_ref = LUA_NOREF;
         if (r->cancel_err) { free(r->cancel_err); r->cancel_err = NULL; }
         CURL_EASY_CLEANUP(easy, "multi_info_done");
         r->easy = NULL;
@@ -452,14 +525,13 @@ static void push_reason(lua_State *L, const char *hbuf, size_t hlen) {
 }
 
 /* Push a Lua table containing lower-cased response headers parsed from the
- * raw wire buffer. Duplicates are comma-folded (matches the pure-Lua
- * backend). The status line is skipped. Terminates at the empty CRLF line
- * that libcurl always emits between the header block and the body. */
+ * raw wire buffer. A first occurrence is a string; repeated occurrences are
+ * converted to a 1-based array, exactly matching the v1 contract. The status
+ * line is skipped. Terminates at the empty CRLF line. */
 static void push_headers_table(lua_State *L, const char *hbuf, size_t hlen) {
     lua_newtable(L);
     const char *cur = hbuf;
     const char *end = hbuf + hlen;
-    /* skip status line */
     while (cur < end && *cur != '\n') cur++;
     if (cur < end) cur++;
     while (cur < end) {
@@ -467,7 +539,7 @@ static void push_headers_table(lua_State *L, const char *hbuf, size_t hlen) {
         if (!eol) break;
         size_t linelen = eol - cur;
         if (linelen && cur[linelen - 1] == '\r') linelen--;
-        if (linelen == 0) break;   /* end of header block */
+        if (linelen == 0) break;
         const char *colon = memchr(cur, ':', linelen);
         if (colon) {
             size_t keylen = colon - cur;
@@ -481,22 +553,20 @@ static void push_headers_table(lua_State *L, const char *hbuf, size_t hlen) {
                 if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
                 kbuf[i] = c;
             }
-            lua_pushlstring(L, kbuf, kn);          /* key */
-            /* fold if existing */
             lua_pushlstring(L, kbuf, kn);
+            lua_pushvalue(L, -1);
             lua_gettable(L, -3);
-            if (lua_isstring(L, -1)) {
-                size_t oldlen; const char *old = lua_tolstring(L, -1, &oldlen);
-                luaL_Buffer bb;
-                luaL_buffinit(L, &bb);
-                luaL_addlstring(&bb, old, oldlen);
-                luaL_addlstring(&bb, ", ", 2);
-                luaL_addlstring(&bb, val, vlen);
-                luaL_pushresult(&bb);
-                lua_remove(L, -2);                 /* drop old */
-            } else {
+            if (lua_isnil(L, -1)) {
                 lua_pop(L, 1);
                 lua_pushlstring(L, val, vlen);
+            } else if (lua_isstring(L, -1)) {
+                lua_newtable(L);
+                lua_pushvalue(L, -2); lua_rawseti(L, -2, 1);
+                lua_pushlstring(L, val, vlen); lua_rawseti(L, -2, 2);
+                lua_remove(L, -2);
+            } else {
+                size_t n = lua_rawlen(L, -1);
+                lua_pushlstring(L, val, vlen); lua_rawseti(L, -2, n + 1);
             }
             lua_settable(L, -3);
         }
@@ -510,6 +580,34 @@ static void push_headers_table(lua_State *L, const char *hbuf, size_t hlen) {
 static void record_cancel(req_ctx_t *r, const char *msg) {
     if (r->cancel_err || !msg) return;
     r->cancel_err = strdup(msg);
+}
+
+static int invoke_oncomplete(lua_State *L, req_ctx_t *r) {
+    if (r->oncomplete_ref == LUA_NOREF) return 0;
+    if (g_main_L && g_main_L != L) {
+        int response_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, r->oncomplete_ref);
+        lua_xmove(L, g_main_L, 1);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, response_ref);
+        lua_xmove(L, g_main_L, 1);
+        if (lua_pcall(g_main_L, 1, 0, 0) != LUA_OK) {
+            const char *msg = lua_tostring(g_main_L, -1);
+            fprintf(stderr, "[luafan2] oncomplete callback error: %s\\n",
+                    msg ? msg : "(non-string error)");
+            lua_pop(g_main_L, 1);
+        }
+        luaL_unref(L, LUA_REGISTRYINDEX, response_ref);
+        return 1;
+    }
+    lua_rawgeti(L, LUA_REGISTRYINDEX, r->oncomplete_ref);
+    lua_pushvalue(L, -2);
+    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+        const char *msg = lua_tostring(L, -1);
+        fprintf(stderr, "[luafan2] oncomplete callback error: %s\\n",
+                msg ? msg : "(non-string error)");
+        lua_pop(L, 1);
+    }
+    return 1;
 }
 
 /* ---- easy-handle write/header callbacks --------------------------------- */
@@ -552,6 +650,30 @@ static size_t cb_write(char *ptr, size_t size, size_t nmemb, void *up) {
     return n;
 }
 
+static int cb_progress(void *up, double dltotal, double dlnow,
+                       double ultotal, double ulnow) {
+    req_ctx_t *r = (req_ctx_t *)up;
+    if (r->cancel_err || !g_main_L) return 1;
+    lua_rawgeti(g_main_L, LUA_REGISTRYINDEX, r->onprogress_ref);
+    lua_pushinteger(g_main_L, (lua_Integer)dltotal);
+    lua_pushinteger(g_main_L, (lua_Integer)dlnow);
+    lua_pushinteger(g_main_L, (lua_Integer)ultotal);
+    lua_pushinteger(g_main_L, (lua_Integer)ulnow);
+    int status = lua_pcall(g_main_L, 4, 1, 0);
+    if (status != LUA_OK) {
+        const char *msg = lua_tostring(g_main_L, -1);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "onprogress callback error: %s", msg ? msg : "(non-string error)");
+        record_cancel(r, buf);
+        lua_pop(g_main_L, 1);
+        return 1;
+    }
+    int cancel = lua_isnumber(g_main_L, -1) && lua_tointeger(g_main_L, -1) != 0;
+    lua_pop(g_main_L, 1);
+    if (cancel) record_cancel(r, "onprogress callback canceled");
+    return cancel ? 1 : 0;
+}
+
 static size_t cb_header(char *ptr, size_t size, size_t nmemb, void *up) {
     req_ctx_t *r = (req_ctx_t *)up;
     size_t n = size * nmemb;
@@ -590,6 +712,8 @@ static size_t cb_header(char *ptr, size_t size, size_t nmemb, void *up) {
     lua_pushinteger(g_main_L, code);       lua_setfield(g_main_L, -2, "status");
     lua_pushinteger(g_main_L, code);       lua_setfield(g_main_L, -2, "responseCode");
     push_reason(g_main_L, hbuf, hlen);     lua_setfield(g_main_L, -2, "reason");
+    lua_getfield(g_main_L, -1, "reason");
+    lua_setfield(g_main_L, -2, "responseMessage");
     push_headers_table(g_main_L, hbuf, hlen); lua_setfield(g_main_L, -2, "headers");
 
     int status = lua_pcall(g_main_L, 1, 1, 0);
@@ -623,19 +747,22 @@ static int l_req_gc(lua_State *L) {
         r->easy = NULL;
     }
     if (r->req_headers) { curl_slist_free_all(r->req_headers); r->req_headers = NULL; }
+    if (r->resolve) { curl_slist_free_all(r->resolve); r->resolve = NULL; }
     if (r->body_copy)   { free(r->body_copy); r->body_copy = NULL; }
     if (r->resp_body)   { evbuffer_free(r->resp_body);   r->resp_body = NULL; }
     if (r->resp_headers){ evbuffer_free(r->resp_headers);r->resp_headers = NULL; }
     /* M20.2: release callback refs if the request never made it to the
      * completion path (rare — l_req_gc mostly fires as a safety net). */
-    if (r->onreceive_ref != LUA_NOREF && g_main_L) {
-        luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onreceive_ref);
-        r->onreceive_ref = LUA_NOREF;
-    }
-    if (r->onheader_ref != LUA_NOREF && g_main_L) {
-        luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onheader_ref);
-        r->onheader_ref = LUA_NOREF;
-    }
+    if (r->onreceive_ref != LUA_NOREF && g_main_L) luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onreceive_ref);
+    r->onreceive_ref = LUA_NOREF;
+    if (r->onheader_ref != LUA_NOREF && g_main_L) luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onheader_ref);
+    r->onheader_ref = LUA_NOREF;
+    if (r->onprogress_ref != LUA_NOREF && g_main_L) luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onprogress_ref);
+    r->onprogress_ref = LUA_NOREF;
+    if (r->onsend_ref != LUA_NOREF && g_main_L) luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onsend_ref);
+    r->onsend_ref = LUA_NOREF;
+    if (r->oncomplete_ref != LUA_NOREF && g_main_L) luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->oncomplete_ref);
+    r->oncomplete_ref = LUA_NOREF;
     if (r->cancel_err) { free(r->cancel_err); r->cancel_err = NULL; }
     return 0;
 }
@@ -669,6 +796,7 @@ static int l_request(lua_State *L) {
     const char *url = luaL_checkstring(L, -1);
     lua_pop(L, 1);
 
+
     lua_getfield(L, 1, "method");
     const char *method = luaL_optstring(L, -1, "GET");
     lua_pop(L, 1);
@@ -694,6 +822,10 @@ static int l_request(lua_State *L) {
     /* M20.2: default callback refs / streaming flags. */
     r->onreceive_ref = LUA_NOREF;
     r->onheader_ref  = LUA_NOREF;
+    r->onprogress_ref = LUA_NOREF;
+    r->onsend_ref = LUA_NOREF;
+    r->oncomplete_ref = LUA_NOREF;
+    r->upload_len    = -1;
     r->buffered      = 1;             /* accumulate response.body by default */
     r->resp_body    = evbuffer_new();
     r->resp_headers = evbuffer_new();
@@ -772,21 +904,51 @@ static int l_request(lua_State *L) {
         curl_easy_setopt(r->easy, CURLOPT_HTTPHEADER, r->req_headers);
     }
 
-    /* Timeout (seconds; libcurl wants ms). */
+    /* v1 timeout semantics: timeout is low-speed timeout; conntimeout is
+     * the overall/connect timeout in seconds. Keep v2's timeout as a
+     * compatible fallback when conntimeout is absent. */
     lua_getfield(L, 1, "timeout");
     if (lua_isnumber(L, -1)) {
-        long ms = (long)(lua_tonumber(L, -1) * 1000.0);
-        if (ms > 0) {
-            curl_easy_setopt(r->easy, CURLOPT_TIMEOUT_MS,        ms);
-            curl_easy_setopt(r->easy, CURLOPT_CONNECTTIMEOUT_MS, ms);
+        long sec = (long)lua_tonumber(L, -1);
+        if (sec > 0) {
+            curl_easy_setopt(r->easy, CURLOPT_LOW_SPEED_LIMIT, 1L);
+            curl_easy_setopt(r->easy, CURLOPT_LOW_SPEED_TIME, sec);
+            curl_easy_setopt(r->easy, CURLOPT_TIMEOUT, sec);
         }
     }
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "conntimeout");
+    if (lua_isnumber(L, -1)) {
+        long sec = (long)lua_tonumber(L, -1);
+        if (sec > 0) curl_easy_setopt(r->easy, CURLOPT_CONNECTTIMEOUT, sec);
+    } else {
+        lua_getfield(L, 1, "timeout");
+        if (lua_isnumber(L, -1) && lua_tonumber(L, -1) > 0)
+            curl_easy_setopt(r->easy, CURLOPT_CONNECTTIMEOUT, (long)lua_tonumber(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "forbid_reuse");
+    if (lua_isnumber(L, -1)) curl_easy_setopt(r->easy, CURLOPT_FORBID_REUSE, lua_tointeger(L, -1));
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "dns_servers");
+    if (lua_isstring(L, -1)) curl_easy_setopt(r->easy, CURLOPT_DNS_SERVERS, lua_tostring(L, -1));
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "verbose");
+    if (lua_isboolean(L, -1) && lua_toboolean(L, -1)) curl_easy_setopt(r->easy, CURLOPT_VERBOSE, 1L);
     lua_pop(L, 1);
 
     /* TLS verify (default true). Accept a single opts.verify, or the
      * finer-grained opts.verify_peer / opts.verify_host that the v1
      * setopt(SSL_VERIFYPEER/HOST) split exposed. */
     int verify_peer = 1, verify_host = 1;
+    lua_getfield(L, 1, "ssl_verifypeer");
+    if (lua_isnumber(L, -1)) verify_peer = lua_tointeger(L, -1) != 0;
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "ssl_verifyhost");
+    if (lua_isnumber(L, -1)) verify_host = lua_tointeger(L, -1) != 0;
+    lua_pop(L, 1);
     lua_getfield(L, 1, "verify");
     if (lua_isboolean(L, -1)) { int v = lua_toboolean(L, -1); verify_peer = v; verify_host = v; }
     lua_pop(L, 1);
@@ -799,6 +961,29 @@ static int l_request(lua_State *L) {
     curl_easy_setopt(r->easy, CURLOPT_SSL_VERIFYPEER, (long)(verify_peer ? 1 : 0));
     /* SSL_VERIFYHOST is 2 (strict) when enabled, 0 when off. */
     curl_easy_setopt(r->easy, CURLOPT_SSL_VERIFYHOST, (long)(verify_host ? 2 : 0));
+
+    const char *cert_fields[] = {"sslcert", "sslcertpasswd", "sslcerttype", "sslkey", "sslkeypasswd", "sslkeytype"};
+    CURLoption cert_opts[] = {CURLOPT_SSLCERT, CURLOPT_SSLCERTPASSWD, CURLOPT_SSLCERTTYPE, CURLOPT_SSLKEY, CURLOPT_SSLKEYPASSWD, CURLOPT_SSLKEYTYPE};
+    for (int ci = 0; ci < 6; ci++) {
+        lua_getfield(L, 1, cert_fields[ci]);
+        if (lua_isstring(L, -1)) curl_easy_setopt(r->easy, cert_opts[ci], lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_getfield(L, 1, "proxy");
+    if (lua_isstring(L, -1)) curl_easy_setopt(r->easy, CURLOPT_PROXY, lua_tostring(L, -1));
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "proxyport");
+    if (lua_isnumber(L, -1)) curl_easy_setopt(r->easy, CURLOPT_PROXYPORT, lua_tointeger(L, -1));
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "proxyuser");
+    if (lua_isstring(L, -1)) curl_easy_setopt(r->easy, CURLOPT_PROXYUSERNAME, lua_tostring(L, -1));
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "proxypassword");
+    if (lua_isstring(L, -1)) curl_easy_setopt(r->easy, CURLOPT_PROXYPASSWORD, lua_tostring(L, -1));
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "proxytunnel");
+    if (lua_isnumber(L, -1)) curl_easy_setopt(r->easy, CURLOPT_HTTPPROXYTUNNEL, lua_tointeger(L, -1));
+    lua_pop(L, 1);
 
     /* Optional global settings (cookiejar / cainfo / capath) live on the
      * Lua-side module table (fan.http._cookiejar etc.); the shim passes
@@ -856,6 +1041,82 @@ static int l_request(lua_State *L) {
     lua_getfield(L, 1, "buffered");
     if (lua_isboolean(L, -1)) r->buffered = lua_toboolean(L, -1);
     lua_pop(L, 1);
+    if (!r->buffered) r->empty_body_string = 1;
+    if (strcmp(meth, "HEAD") == 0) r->empty_body_string = 1;
+
+    lua_getfield(L, 1, "onprogress");
+    if (lua_isfunction(L, -1)) {
+        r->onprogress_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        curl_easy_setopt(r->easy, CURLOPT_XFERINFOFUNCTION, cb_progress);
+        curl_easy_setopt(r->easy, CURLOPT_XFERINFODATA, r);
+        curl_easy_setopt(r->easy, CURLOPT_PROGRESSFUNCTION, cb_progress);
+        curl_easy_setopt(r->easy, CURLOPT_PROGRESSDATA, r);
+        curl_easy_setopt(r->easy, CURLOPT_NOPROGRESS, 0L);
+    } else if (lua_isnil(L, -1)) lua_pop(L, 1);
+    else { lua_pop(L, 1); return luaL_error(L, "onprogress must be a function"); }
+
+    lua_getfield(L, 1, "onsend");
+    if (lua_isfunction(L, -1)) {
+        r->onsend_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        size_t cap = 0;
+        for (;;) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, r->onsend_ref);
+            lua_pushinteger(L, 16384);
+            if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+                const char *msg = lua_tostring(L, -1);
+                return luaL_error(L, "onsend callback error: %s", msg ? msg : "unknown");
+            }
+            if (lua_isnil(L, -1)) { lua_pop(L, 1); break; }
+            size_t part_len = 0;
+            const char *part = lua_tolstring(L, -1, &part_len);
+            if (!part) { lua_pop(L, 1); return luaL_error(L, "onsend must return string or nil"); }
+            char *next = (char *)realloc(r->body_copy, r->body_len + part_len + 1);
+            if (!next) { lua_pop(L, 1); return luaL_error(L, "onsend body out of memory"); }
+            r->body_copy = next;
+            memcpy(r->body_copy + r->body_len, part, part_len);
+            r->body_len += part_len;
+            r->body_copy[r->body_len] = '\0';
+            lua_pop(L, 1);
+            cap += part_len;
+            if (part_len == 0 || part_len < 16384) break;
+            if (cap > 64 * 1024 * 1024) return luaL_error(L, "onsend body exceeds 64MiB");
+        }
+        curl_easy_setopt(r->easy, CURLOPT_POSTFIELDS, r->body_copy ? r->body_copy : "");
+        curl_easy_setopt(r->easy, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)r->body_len);
+        curl_easy_setopt(r->easy, CURLOPT_CUSTOMREQUEST, meth);
+    } else if (lua_isnil(L, -1)) lua_pop(L, 1);
+    else { lua_pop(L, 1); return luaL_error(L, "onsend must be a function"); }
+
+    lua_getfield(L, 1, "onbodylength");
+    if (lua_isfunction(L, -1)) {
+        lua_pushvalue(L, 1);
+        if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+            const char *msg = lua_tostring(L, -1);
+            return luaL_error(L, "onbodylength callback error: %s", msg ? msg : "unknown");
+        }
+        if (!lua_isnumber(L, -1)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "onbodylength must return a number");
+        }
+        r->upload_len = (curl_off_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+    } else if (lua_isnil(L, -1)) lua_pop(L, 1);
+    else { lua_pop(L, 1); return luaL_error(L, "onbodylength must be a function"); }
+    if (r->upload_len >= 0) {
+        curl_easy_setopt(r->easy, CURLOPT_POSTFIELDSIZE_LARGE, r->upload_len);
+    }
+
+    lua_getfield(L, 1, "oncomplete");
+    if (lua_isfunction(L, -1)) r->oncomplete_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    else if (lua_isnil(L, -1)) lua_pop(L, 1);
+    else { lua_pop(L, 1); return luaL_error(L, "oncomplete must be a function"); }
+
+    lua_getfield(L, 1, "resolve");
+    if (lua_isstring(L, -1)) {
+        r->resolve = curl_slist_append(NULL, lua_tostring(L, -1));
+        curl_easy_setopt(r->easy, CURLOPT_RESOLVE, r->resolve);
+    }
+    lua_pop(L, 1);
 
     /* Attach easy to the multi. We DON'T park the coroutine yet: if the
      * transfer completes synchronously inside curl_multi_socket_action
@@ -885,7 +1146,8 @@ static int l_request(lua_State *L) {
      * co_ref == LUA_NOREF and just pushes values without resuming. */
     check_multi_info();
     if (r->done) {
-        /* Values already on our stack; simply return. */
+        /* Values already on our stack; return the exact callback-aware count. */
+        if (r->suppress_return) return 0;
         return r->curl_result == CURLE_OK ? 1 : 2;
     }
     /* Not done yet: park + yield. The wake path will push return values

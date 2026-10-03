@@ -127,21 +127,35 @@ local function c_do_once(opts)
     body    = opts.body,
     timeout = opts.timeout,
   }
-  -- verify: allow either coarse `verify` (bool) or fine-grained
-  -- verify_peer / verify_host to reach the C backend as-is.
   if opts.verify ~= nil       then c_opts.verify = opts.verify end
   if opts.verify_peer ~= nil  then c_opts.verify_peer = opts.verify_peer end
   if opts.verify_host ~= nil  then c_opts.verify_host = opts.verify_host end
-  -- M20.2: forward streaming callbacks + buffered flag to the C backend.
-  -- onreceive(chunk) fires from libcurl's WRITEFUNCTION for each decoded
-  -- body segment; onheader(info) fires once from HEADERFUNCTION at the
-  -- header/body boundary. buffered=false makes response.body come back
-  -- empty so large streams don't sit in memory.
+  if opts.ssl_verifypeer ~= nil then c_opts.ssl_verifypeer = opts.ssl_verifypeer end
+  if opts.ssl_verifyhost ~= nil then c_opts.ssl_verifyhost = opts.ssl_verifyhost end
   if opts.onreceive ~= nil    then c_opts.onreceive = opts.onreceive end
   if opts.onheader ~= nil     then c_opts.onheader  = opts.onheader end
+  if opts.onprogress ~= nil   then c_opts.onprogress = opts.onprogress end
+  if opts.onsend ~= nil       then c_opts.onsend = opts.onsend end
+  if opts.onbodylength ~= nil then c_opts.onbodylength = opts.onbodylength end
+  if opts.oncomplete ~= nil   then c_opts.oncomplete = opts.oncomplete end
   if opts.buffered ~= nil     then c_opts.buffered  = opts.buffered end
-  -- Module-scoped defaults for cookiejar / cainfo / capath — allow the
-  -- per-call opts to override.
+  if opts.verbose ~= nil     then c_opts.verbose = opts.verbose end
+  if opts.dns_servers ~= nil then c_opts.dns_servers = opts.dns_servers end
+  if opts.conntimeout ~= nil then c_opts.conntimeout = opts.conntimeout end
+  if opts.forbid_reuse ~= nil then c_opts.forbid_reuse = opts.forbid_reuse end
+  if opts.resolve ~= nil then c_opts.resolve = opts.resolve end
+  if opts.worker ~= nil then c_opts.worker = opts.worker end
+  if opts.sslcert ~= nil then c_opts.sslcert = opts.sslcert end
+  if opts.sslcertpasswd ~= nil then c_opts.sslcertpasswd = opts.sslcertpasswd end
+  if opts.sslcerttype ~= nil then c_opts.sslcerttype = opts.sslcerttype end
+  if opts.sslkey ~= nil then c_opts.sslkey = opts.sslkey end
+  if opts.sslkeypasswd ~= nil then c_opts.sslkeypasswd = opts.sslkeypasswd end
+  if opts.sslkeytype ~= nil then c_opts.sslkeytype = opts.sslkeytype end
+  if opts.proxy ~= nil then c_opts.proxy = opts.proxy end
+  if opts.proxyport ~= nil then c_opts.proxyport = opts.proxyport end
+  if opts.proxyuser ~= nil then c_opts.proxyuser = opts.proxyuser end
+  if opts.proxypassword ~= nil then c_opts.proxypassword = opts.proxypassword end
+  if opts.proxytunnel ~= nil then c_opts.proxytunnel = opts.proxytunnel end
   c_opts.cookiejar = opts.cookiejar or M._cookiejar
   c_opts.cainfo    = opts.cainfo    or M._cainfo
   c_opts.capath    = opts.capath    or M._capath
@@ -199,7 +213,8 @@ function M.request(opts)
     o.query  = nil                    -- already folded into url
     local resp, err = c_do_once(o)
     if not resp then return nil, err end
-    if follow and is_redirect(resp.status) and resp.headers["location"] then
+    if follow and resp.status and is_redirect(resp.status)
+        and resp.headers and resp.headers["location"] then
       hops = hops + 1
       if hops > max_redirects then return nil, "too many redirects" end
       url = resolve_location(url, resp.headers["location"])
@@ -212,7 +227,7 @@ function M.request(opts)
         body = nil
       end
     else
-      return resp
+      return resp, err
     end
   end
 end

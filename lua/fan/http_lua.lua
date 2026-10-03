@@ -187,7 +187,6 @@ local function read_headers(reader)
     local k, v = line:match("^([^:]+):%s*(.*)$")
     if k then
       k = k:lower()
-      -- fold duplicate headers (e.g. Set-Cookie) into a list-ish comma join
       if headers[k] then
         headers[k] = headers[k] .. ", " .. v
       else

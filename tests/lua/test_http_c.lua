@@ -231,20 +231,15 @@ s:test("404 non-2xx still returns a response (not an error)", function()
   T.eq(resp.body, "nope")
 end)
 
-s:test("Duplicate response headers folded with ', '", function()
+s:test("Duplicate response headers use the v1 string-or-array shape", function()
   local PORT = 25508
   local server, resp
   run(function()
-    server = assert(httpd_lua.bind{
-      port = PORT,
-      onService = function(req, r)
-        -- addheader appends a second Set-Cookie: the C backend's header
-        -- callback must fold duplicates into a single lowercased entry.
-        r:addheader("Set-Cookie", "a=1")
-        r:addheader("Set-Cookie", "b=2")
-        r:reply(200, { ["Content-Type"] = "text/plain" }, "ok")
-      end,
-    })
+    server = assert(fan.tcp.bind("127.0.0.1", PORT, function(conn)
+      conn:send("HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+      fan.sleep(0.02)
+      conn:close()
+    end))
     resp = http.request{
       backend = "c",
       url = BASE .. PORT .. "/cookies",
@@ -253,13 +248,15 @@ s:test("Duplicate response headers folded with ', '", function()
   if server then server:close() end
   T.not_nil(resp)
   T.eq(resp.status, 200)
-  -- Both cookies present, in original order, separated by ", ".
+  T.eq(resp.responseCode, 200)
+  T.eq(resp.reason, "OK")
+  T.eq(resp.responseMessage, "OK")
+  T.eq(type(resp.total_time), "number")
+  T.eq(type(resp.dns_time), "number")
   local sc = resp.headers["set-cookie"]
-  T.not_nil(sc)
-  T.truthy(sc:find("a=1", 1, true), "missing a=1 in: " .. tostring(sc))
-  T.truthy(sc:find("b=2", 1, true), "missing b=2 in: " .. tostring(sc))
-  T.truthy(sc:find("a=1, b=2", 1, true) or sc:find("a=1,b=2", 1, true),
-    "expected fold with ', ': " .. tostring(sc))
+  T.eq(type(sc), "table")
+  T.eq(sc[1], "a=1")
+  T.eq(sc[2], "b=2")
 end)
 
 s:test("Chunked transfer-encoding response is assembled", function()
@@ -287,9 +284,10 @@ s:test("Chunked transfer-encoding response is assembled", function()
   T.eq(resp.body, "part-1;part-2;end")
 end)
 
-s:test("Connection refused returns nil, err", function()
+s:test("Connection refused keeps v1 error response and v2 err", function()
   -- Port 1 is essentially guaranteed to be closed for an unprivileged
-  -- process on Linux; the client should surface a curl-shaped error.
+  -- process on Linux. C returns the v1 response table with error and also
+  -- preserves the v2 second return value.
   local resp, err
   run(function()
     resp, err = http.request{
@@ -298,7 +296,9 @@ s:test("Connection refused returns nil, err", function()
       timeout = 2,
     }
   end)
-  T.is_nil(resp)
+  T.not_nil(resp)
+  T.eq(resp.status, 0)
+  T.is_type(resp.error, "string")
   T.is_type(err, "string")
   T.truthy(#err > 0, "empty error message")
 end)
@@ -516,7 +516,9 @@ s:test("M20.2: onreceive returning false aborts with explicit error", function()
     }
   end)
   if server then server:close() end
-  T.is_nil(resp)
+  T.not_nil(resp)
+  T.eq(resp.status, 0)
+  T.is_type(resp.error, "string")
   T.is_type(err, "string")
   T.eq(calls, 1, "callback fired past cancellation")
   T.truthy(err:find("onreceive callback canceled", 1, true),
@@ -540,7 +542,9 @@ s:test("M20.2: onreceive exception surfaces as callback error", function()
     }
   end)
   if server then server:close() end
-  T.is_nil(resp)
+  T.not_nil(resp)
+  T.eq(resp.status, 0)
+  T.is_type(resp.error, "string")
   T.is_type(err, "string")
   T.truthy(err:find("onreceive callback error", 1, true), err)
   T.truthy(err:find("boom-c-stream", 1, true), err)
@@ -565,7 +569,9 @@ s:test("M20.2: onheader returning false aborts the request", function()
     }
   end)
   if server then server:close() end
-  T.is_nil(resp)
+  T.not_nil(resp)
+  T.eq(resp.status, 0)
+  T.is_type(resp.error, "string")
   T.is_type(err, "string")
   T.truthy(err:find("onheader callback canceled", 1, true),
     "expected 'onheader callback canceled', got: " .. tostring(err))
@@ -630,7 +636,9 @@ s:test("socket-context stress: mixed concurrent batches and callback cancellatio
           end,
         }
         if n % 17 == 0 then
-          T.is_nil(response)
+          T.not_nil(response)
+          T.eq(response.status, 0)
+          T.is_type(response.error, "string")
           T.truthy(err and err:find("callback", 1, true))
           failures[#failures + 1] = n
         else
@@ -651,5 +659,108 @@ s:test("socket-context stress: mixed concurrent batches and callback cancellatio
   T.eq(#failures, 8)
   T.eq(#results, total - #failures)
 end)
+
+s:test("v1 oncomplete callback receives response and suppresses return", function()
+  local PORT = 25525
+  local server, callback_response, returned
+  run(function()
+    server = assert(httpd_lua.bind{
+      port = PORT,
+      onService = function(req, r)
+        r:reply(200, {["Content-Type"] = "text/plain"}, "hello")
+      end,
+    })
+    returned = http.request{
+      backend = "c",
+      url = BASE .. PORT .. "/hello",
+      oncomplete = function(resp)
+        callback_response = resp
+      end,
+    }
+    server:close()
+  end)
+  T.is_nil(returned)
+  T.not_nil(callback_response)
+  T.eq(callback_response.responseCode, 200)
+  T.eq(callback_response.responseMessage, "OK")
+  T.eq(callback_response.body, "hello")
+end)
+
+s:test("v1 onprogress callback receives four numeric counters", function()
+  local PORT = 25526
+  local server, seen, response
+  run(function()
+    server = assert(httpd_lua.bind{
+      port = PORT,
+      onService = function(req, r)
+        r:reply(200, {["Content-Type"] = "text/plain"}, "hello")
+      end,
+    })
+    seen = 0
+    response = http.request{
+      backend = "c",
+      url = BASE .. PORT .. "/hello",
+      onprogress = function(dltotal, dlnow, ultotal, ulnow)
+        T.eq(type(dltotal), "number")
+        T.eq(type(dlnow), "number")
+        T.eq(type(ultotal), "number")
+        T.eq(type(ulnow), "number")
+        seen = seen + 1
+        return 0
+      end,
+    }
+    server:close()
+  end)
+  T.not_nil(response)
+  T.truthy(seen > 0)
+end)
+
+s:test("v1 onsend callback uploads returned chunks", function()
+  local PORT = 25537
+  local server, response, self_seen
+  run(function()
+    server = assert(httpd_lua.bind{
+      port = PORT,
+      onService = function(req, r)
+        r:reply(200, {["Content-Type"] = "text/plain"}, req.body or "")
+      end,
+    })
+    response = http.request{
+      backend = "c",
+      method = "POST",
+      url = BASE .. PORT .. "/upload",
+      onbodylength = function(args)
+        self_seen = args ~= nil and args.method == "POST"
+        return 11
+      end,
+      onsend = function(size)
+        if size > 0 then return "onsend-body" end
+        return nil
+      end,
+    }
+    server:close()
+  end)
+  T.not_nil(response)
+  T.truthy(self_seen, "onbodylength must receive the v1 args self table")
+  T.eq(response.body, "onsend-body")
+end)
+
+s:test("v1 oncomplete also receives error responses and suppresses returns", function()
+  local callback_response, returned, err
+  run(function()
+    returned, err = http.request{
+      backend = "c",
+      url = "http://127.0.0.1:1/",
+      timeout = 2,
+      oncomplete = function(resp) callback_response = resp end,
+    }
+  end)
+  T.is_nil(returned)
+  T.is_nil(err)
+  T.not_nil(callback_response)
+  T.eq(callback_response.status, 0)
+  T.is_type(callback_response.error, "string")
+end)
+
 
 os.exit(T.run(s))

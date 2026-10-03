@@ -18,19 +18,35 @@ transparent to callers.
 
 ## Response shape
 
+The response protocol is implemented in the C HTTP backend. It preserves the
+v1 field names and types while retaining v2 additions:
+
 ```
-{ status         = 200,          -- numeric HTTP status
-  responseCode   = 200,          -- v1-compatible alias (M16.4)
-  reason         = "OK",         -- reason phrase
-  headers        = { ["content-type"] = "..." },  -- keys lowercased
-  body           = "..."         -- raw response body (bytes)
+{ status          = 200,          -- v2 name
+  responseCode    = 200,          -- v1 name
+  reason          = "OK",         -- v2 reason phrase
+  responseMessage = "OK",         -- v1 reason phrase
+  headers         = {              -- lower-case keys, v1 value shape
+    ["content-type"] = "...",    -- one value: string
+    ["set-cookie"]   = {"a=1", "b=2"}, -- repeated: 1-based array
+  },
+  body            = "...",        -- raw response body (bytes)
+  cookies         = {...},         -- libcurl COOKIEINFO lines, when enabled
+  dns_time        = 0.001,         -- seconds, libcurl timing info
+  connect_time    = 0.002,
+  appconnect_time = 0.000,
+  pretransfer_time= 0.002,
+  starttransfer_time = 0.010,
+  total_time      = 0.012,
+  error           = "..."          -- present on completed transfer errors
 }
 ```
 
-The `responseCode` field is an alias for `status` — v1 code frequently
-reads `resp.responseCode` and rejecting that would force every ported
-handler to patch its status checks.  Both backends set both fields on
-every response; keeping them in sync is part of the contract.
+The `headers` rule is part of the wire-compatible v1 contract: a repeated
+header is never comma-folded into a string. Both the final response and the
+C `onheader` callback use this same string-or-array shape. The compatibility
+fields and timing/cookie fields are produced in C; the Lua shim does not
+rewrite or synthesize response objects.
 
 ## Verb helper calling conventions (M16.4)
 
@@ -75,23 +91,35 @@ both call.
 303 (and 301/302 with a non-GET request) switch to GET and drop the
 request body on redirect — same as v1 and the pure-Lua backend.
 
+## v1 parameter and callback compatibility
+
+The C backend accepts the v1 request parameters in addition to the v2
+options: `verbose`, `dns_servers`, `onprogress`, `timeout`, `conntimeout`,
+`ssl_verifypeer`, `ssl_verifyhost`, `sslcert`, `sslcertpasswd`,
+`sslcerttype`, `sslkey`, `sslkeypasswd`, `sslkeytype`, `cainfo`, `capath`,
+`proxy`, `proxyport`, `proxyuser`, `proxypassword`, `proxytunnel`, `onsend`,
+`onbodylength`, `oncomplete`, `forbid_reuse`, and `resolve`.
+The Lua file only forwards them. The legacy `worker` option is intentionally
+out of scope in v2.
+
+* `onprogress(dltotal, dlnow, ultotal, ulnow)` uses the v1 four-counter
+  callback contract.
+* `onsend(size)` returns a string chunk or `nil` to finish; `onbodylength` is
+  called as `onbodylength(args)` with the v1 options table as self and its
+  numeric result controls the upload length.
+* `oncomplete(response)` receives both successful and error response tables
+  and suppresses the normal return value; callback errors are logged without
+  replacing the response protocol.
+* `onheader(response)` and `onreceive(chunk)` retain the streaming behavior;
+  callback errors return the v1 `{error=...}` response plus the v2 error
+  string. `buffered=false` and HEAD preserve the v2 empty-string body rule.
+
 ## Streaming callbacks (M20)
 
 Both backends accept optional `onheader` and `onreceive` callbacks
-plus a `buffered` toggle.  See
-[M20 HTTP streaming callbacks](m20-http-streaming.md) for the full
-contract, but the summary is:
-
-* `onheader(response)` runs once when the status line + headers are
-  fully parsed, before any body byte is delivered.
-* `onreceive(chunk)` runs for each decoded body slice; chunked
-  framing is not exposed.
-* `buffered = true` (default even when `onreceive` is set) keeps
-  `response.body` as the complete aggregate.  `buffered = false`
-  skips accumulation for streaming-only consumers (SSE / large
-  downloads / long-poll).
-* Returning `false` (or raising) from either callback cancels the
-  in-flight request and produces `nil, err`.
+plus a `buffered` toggle. `onheader` runs before body delivery;
+`onreceive` sees decoded body slices, and `buffered=false` skips
+aggregation for streaming consumers.
 
 ## HTTP server request query contract (v1 compatibility)
 
