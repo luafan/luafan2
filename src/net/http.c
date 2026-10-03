@@ -383,10 +383,11 @@ static void check_multi_info(void) {
             if (blen) {
                 const char *bbuf = (const char *)evbuffer_pullup(r->resp_body, -1);
                 lua_pushlstring(co, bbuf, blen);
-            } else if (r->empty_body_string || code == 204) {
-                lua_pushliteral(co, "");
             } else {
-                lua_pushnil(co);
+                /* A completed buffered response always exposes a string body;
+                 * this preserves the v1 empty-body contract for 200/204/HEAD
+                 * alike and avoids backend-dependent nil results. */
+                lua_pushliteral(co, "");
             }
             lua_setfield(co, -2, "body");
 
