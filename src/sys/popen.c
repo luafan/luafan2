@@ -723,8 +723,32 @@ static void popen_release(popen_t *p) {
         int status = 0;
         pid_t r = waitpid(p->pid, &status, WNOHANG);
         if (r == 0) { usleep(10000); r = waitpid(p->pid, &status, WNOHANG); }
-        if (r == 0) { kill(target, SIGKILL); waitpid(p->pid, &status, 0); }
+        if (r == 0) {
+            kill(target, SIGKILL);
+            r = waitpid(p->pid, &status, 0);
+        }
+        if (r == p->pid) {
+            if (WIFEXITED(status)) {
+                p->exit_code = WEXITSTATUS(status);
+                p->exit_reason = "exit";
+            } else if (WIFSIGNALED(status)) {
+                p->exit_code = 128 + WTERMSIG(status);
+                p->exit_reason = "signal";
+            }
+            p->reaped = 1;
+        }
         p->pid = -1;
+    }
+
+    /* close() tears down the read events as well as the child. Mark both
+     * streams complete so a later recv() returns the latched exit tuple
+     * instead of parking forever waiting for events that were removed. */
+    p->stdout_eof = 1;
+    p->stderr_eof = 1;
+    if (!p->reaped) {
+        p->reaped = 1;
+        p->exit_code = -1;
+        p->exit_reason = "closed";
     }
 
     free_chunks(p);
