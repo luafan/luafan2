@@ -383,7 +383,7 @@ static void check_multi_info(void) {
             if (blen) {
                 const char *bbuf = (const char *)evbuffer_pullup(r->resp_body, -1);
                 lua_pushlstring(co, bbuf, blen);
-            } else if (r->empty_body_string) {
+            } else if (r->empty_body_string || code == 204) {
                 lua_pushliteral(co, "");
             } else {
                 lua_pushnil(co);

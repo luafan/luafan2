@@ -231,6 +231,27 @@ s:test("404 non-2xx still returns a response (not an error)", function()
   T.eq(resp.body, "nope")
 end)
 
+s:test("204 response exposes an empty body string", function()
+  local PORT = 25508
+  local server, resp
+  run(function()
+    server = assert(httpd_lua.bind{
+      port = PORT,
+      onService = function(_, r)
+        r:reply(204, {}, "")
+      end,
+    })
+    resp = http.request{
+      backend = "c",
+      url = BASE .. PORT .. "/no-content",
+    }
+  end)
+  if server then server:close() end
+  T.not_nil(resp)
+  T.eq(resp.status, 204)
+  T.eq(resp.body, "")
+end)
+
 s:test("Duplicate response headers use the v1 string-or-array shape", function()
   local PORT = 25508
   local server, resp
