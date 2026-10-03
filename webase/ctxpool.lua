@@ -1,9 +1,9 @@
 -- ctxpool.lua — compatibility facade for the retired webase ctxpool.
 --
--- The v1 module scanned WORKDIR/database/*.lua, merged the returned schema
--- tables, and exposed a pool whose pop() returned an ORM context. LuaFan v2
--- keeps that application-facing facade while using its split primitives:
--- fan.mariadb.pool for connections and fan.orm for models.
+-- The v1 module recursively scanned WORKDIR/database/, merged the returned
+-- schema tables, and exposed a pool whose pop() returned an ORM context.
+-- LuaFan v2 keeps that application-facing facade while using its split
+-- primitives: fan.mariadb.pool for connections and fan.orm for models.
 --
 -- Compatibility surface:
 --   local ctxpool = require "ctxpool"
@@ -31,35 +31,50 @@ end
 
 local function load_schemas()
   local schemas = {}
-  local entries = posix.readdir(database_dir)
-  if not entries then return schemas end
-  table.sort(entries)
-  for _, filename in ipairs(entries) do
-    if filename:sub(1, 1) ~= "." and filename:sub(-#MODULE_EXT) == MODULE_EXT then
-      local path = database_dir .. "/" .. filename
-      local env = setmetatable({ WORKDIR = workdir }, { __index = _G })
-      local chunk, err = loadfile(path, MODULE_LOAD_MODE, env)
-      if not chunk then
-        print("[ctxpool] load error: " .. path .. ": " .. tostring(err))
-      else
-        local ok, returned = pcall(chunk)
-        if not ok then
-          print("[ctxpool] exec error: " .. path .. ": " .. tostring(returned))
-        elseif type(returned) == "table" then
-          local single_name = returned.name or returned.table
-          if single_name and type(returned.schema) == "table" then
-            schemas[single_name] = returned.schema
-          else
-            for name, schema in pairs(returned) do
-              if type(name) == "string" and type(schema) == "table" then
-                schemas[name] = schema
-              end
-            end
-          end
-        end
+
+  local function load_file(path)
+    local env = setmetatable({ WORKDIR = workdir }, { __index = _G })
+    local chunk, err = loadfile(path, MODULE_LOAD_MODE, env)
+    if not chunk then
+      print("[ctxpool] load error: " .. path .. ": " .. tostring(err))
+      return
+    end
+    local ok, returned = pcall(chunk)
+    if not ok then
+      print("[ctxpool] exec error: " .. path .. ": " .. tostring(returned))
+      return
+    end
+    if type(returned) ~= "table" then return end
+    local single_name = returned.name or returned.table
+    if single_name and type(returned.schema) == "table" then
+      schemas[single_name] = returned.schema
+      return
+    end
+    for name, schema in pairs(returned) do
+      if type(name) == "string" and type(schema) == "table" then
+        schemas[name] = schema
       end
     end
   end
+
+  local function load_path(path)
+    local attr = posix.stat(path)
+    if not attr then return end
+    if attr.mode == "directory" then
+      local entries = posix.readdir(path)
+      if not entries then return end
+      table.sort(entries)
+      for _, name in ipairs(entries) do
+        if name:sub(1, 1) ~= "." then
+          load_path(path .. "/" .. name)
+        end
+      end
+    elseif attr.mode == "file" and path:sub(-#MODULE_EXT) == MODULE_EXT then
+      load_file(path)
+    end
+  end
+
+  load_path(database_dir)
   return schemas
 end
 

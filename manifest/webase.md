@@ -62,13 +62,13 @@ succeeds, header set), forced failure via monkey-patched
 ## ctxpool compatibility facade (M25)
 
 `webase/ctxpool.lua` restores the legacy `require("ctxpool")` entry point
-on top of `fan.mariadb.pool` and `fan.orm`. It scans
-`WORKDIR/database/*.lua`, accepts both a map of table schemas and the
-single-table `{name=..., schema=...}` form, and exposes `pop`, `push`,
-`safe`, `close`, and `stats`. A borrowed context exposes models through both
-`ctx.models[name]` and `ctx[name]`. `maria_socket` / `MARIA_SOCKET` selects a
-Unix socket without also sending a host option; otherwise the normal host
-configuration is used.
+on top of `fan.mariadb.pool` and `fan.orm`. It recursively scans
+`WORKDIR/database/` for non-hidden `.lua` files, accepts both a map of table
+schemas and the single-table `{name=..., schema=...}` form, and exposes
+`pop`, `push`, `safe`, `close`, and `stats`. A borrowed context exposes models
+through both `ctx.models[name]` and `ctx[name]`. `maria_socket` /
+`MARIA_SOCKET` selects a Unix socket without also sending a host option;
+otherwise the normal host configuration is used.
 
 `tests/lua/test_ctxpool.lua` includes a live MariaDB test with six concurrent
 Fan coroutines. Each coroutine performs 100 insert/yield/find request cycles

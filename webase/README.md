@@ -137,31 +137,27 @@ replacement candidates live at
 
 v1 shipped a small `ctxpool` that scanned `database/*.lua` (each file
 returning an ORM schema table) and passed the result to
-`mariadb.pool.new(list)`. luafan2's `fan.mariadb.pool.new{...}` takes
-a **connection options** table, and its ORM is a separate module
-(`fan.orm`), so v1's fused constructor no longer fits.
-
-Rather than ship a shim that would silently drop half the schema, we
-kept `webase/ctxpool.lua` as a hard error with migration notes. Apps
-that need a MariaDB pool should call
-`fan.mariadb.pool.new{...}` directly from their service or handler
-modules, and layer `fan.orm` on top when needed:
+`mariadb.pool.new(list)`. luafan2 now restores the fused entry point at
+`webase/ctxpool.lua`: it scans and aggregates those schemas, builds models
+through `fan.orm`, and borrows connections from `fan.mariadb.pool`.
 
 ```lua
-local pool = require("fan.mariadb.pool").new{
-  host = config.maria_host,
-  port = config.maria_port,
-  user = config.maria_user,
-  password = config.maria_passwd,
-  database = config.maria_database,
-  charset = config.maria_charset,
-  max_size = config.maria_pool_size,
-}
-pool:with(function(db)
-  local rows = db:query("select 1")
-  ...
+local ctxpool = require("ctxpool")
+local ctx, err = ctxpool:pop()
+if ctx then
+  local row = ctx.models.items.find_by{ id = 1 }
+  ctxpool:push(ctx)
+end
+ctxpool:safe(function(ctx)
+  return ctx.items.find_by{ id = 1 }
 end)
 ```
+
+The facade preserves both `ctx.models[name]` and `ctx[name]`, plus `pop`,
+`push`, `safe`, `close`, and `stats`. It accepts map-style schemas and the
+legacy single-table `{name=..., schema=...}` form. Database connection
+errors remain lazy: requiring the module constructs the pool, while the
+first `pop` attempts a MariaDB connection.
 
 ## AES-GCM
 

@@ -30,6 +30,22 @@ s:test("loads without connecting and exposes legacy facade", function()
   T.eq(stats.idle, 0)
 end)
 
+s:test("recursively aggregates map and single-table schemas", function()
+  local old_workdir = _G.WORKDIR
+  _G.WORKDIR = "/work/tests/fixtures/ctxpool/"
+  package.loaded["config"] = nil
+  package.loaded["fan.config"] = nil
+  package.loaded["ctxpool"] = nil
+  local fixture_pool = require("ctxpool")
+  T.eq(fixture_pool.schemas.items.value, "INT NOT NULL")
+  T.eq(fixture_pool.schemas.audit.id, "INT AUTO_INCREMENT PRIMARY KEY")
+  fixture_pool:close()
+  _G.WORKDIR = old_workdir
+  package.loaded["config"] = nil
+  package.loaded["fan.config"] = nil
+  package.loaded["ctxpool"] = pool
+end)
+
 s:test("safe rejects a non-function without touching MariaDB", function()
   local value, err = pool:safe("not a function")
   T.is_nil(value)
