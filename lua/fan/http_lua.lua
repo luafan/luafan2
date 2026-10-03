@@ -188,7 +188,11 @@ local function read_headers(reader)
     if k then
       k = k:lower()
       if headers[k] then
-        headers[k] = headers[k] .. ", " .. v
+        if type(headers[k]) == "table" then
+          headers[k][#headers[k] + 1] = v
+        else
+          headers[k] = { headers[k], v }
+        end
       else
         headers[k] = v
       end
@@ -273,6 +277,31 @@ local function do_once(opts)
 
   -- build request
   local body = opts.body or ""
+  if opts.onbodylength ~= nil and type(opts.onbodylength) ~= "function" then
+    return nil, "onbodylength must be a function"
+  end
+  if opts.onsend ~= nil and type(opts.onsend) ~= "function" then
+    return nil, "onsend must be a function"
+  end
+  if opts.onbodylength then
+    local ok, length = pcall(opts.onbodylength, opts)
+    if not ok then return nil, "onbodylength callback error: " .. tostring(length) end
+    if type(length) ~= "number" then return nil, "onbodylength must return a number" end
+    body = ""
+    opts._pure_lua_body_length = length
+  end
+  if opts.onsend then
+    local chunks = {}
+    while true do
+      local ok, chunk = pcall(opts.onsend, 16384)
+      if not ok then return nil, "onsend callback error: " .. tostring(chunk) end
+      if chunk == nil then break end
+      if type(chunk) ~= "string" then return nil, "onsend must return string or nil" end
+      chunks[#chunks + 1] = chunk
+      if #chunk < 16384 then break end
+    end
+    body = table.concat(chunks)
+  end
   local lines = {
     string.format("%s %s HTTP/1.1", method, pathq),
     "Host: " .. host .. ((port ~= 80 and port ~= 443) and (":" .. port) or ""),
@@ -286,8 +315,11 @@ local function do_once(opts)
       sent_headers[k:lower()] = true
     end
   end
-  if #body > 0 and not sent_headers["content-length"] then
-    lines[#lines + 1] = "Content-Length: " .. #body
+  if not sent_headers["content-length"] then
+    local content_length = opts._pure_lua_body_length or #body
+    if content_length > 0 or method == "POST" or method == "PUT" or method == "PATCH" then
+      lines[#lines + 1] = "Content-Length: " .. content_length
+    end
   end
   local request = table.concat(lines, "\r\n") .. "\r\n\r\n" .. body
 
@@ -357,13 +389,12 @@ local function do_once(opts)
 
   conn:close()
   return {
-    status       = code,
-    -- M16.4: v1 fan.http named this field `responseCode`; keep as an alias
-    -- so legacy code reading resp.responseCode works on both backends.
-    responseCode = code,
-    reason       = reason,
-    headers      = headers,
-    body         = resp_body,
+    status          = code,
+    responseCode    = code,
+    reason          = reason,
+    responseMessage = reason,
+    headers         = headers,
+    body            = resp_body,
   }
 end
 
@@ -379,6 +410,27 @@ function M.request(opts)
   if follow == nil then follow = true end
   local max_redirects = opts.max_redirects or 5
 
+  local function complete(resp, err)
+    if opts.oncomplete ~= nil and type(opts.oncomplete) ~= "function" then
+      return nil, "oncomplete must be a function"
+    end
+    if not resp then
+      if opts.oncomplete then
+        local error_response = { status = 0, responseCode = 0, headers = {}, error = err }
+        local ok, callback_err = pcall(opts.oncomplete, error_response)
+        if not ok then return nil, "oncomplete callback error: " .. tostring(callback_err) end
+        return nil
+      end
+      return nil, err
+    end
+    if opts.oncomplete then
+      local ok, callback_err = pcall(opts.oncomplete, resp)
+      if not ok then return nil, "oncomplete callback error: " .. tostring(callback_err) end
+      return nil
+    end
+    return resp, err
+  end
+
   local url = opts.url
   local method = opts.method
   local hops = 0
@@ -388,12 +440,12 @@ function M.request(opts)
     o.url = url
     o.method = method or opts.method
     local resp, err = do_once(o)
-    if not resp then return nil, err end
+    if not resp then return complete(nil, err) end
     if follow and is_redirect(resp.status) and resp.headers["location"] then
       hops = hops + 1
-      if hops > max_redirects then return nil, "too many redirects" end
+      if hops > max_redirects then return complete(nil, "too many redirects") end
       local loc = resp.headers["location"]
-      -- resolve relative redirect against current url
+      if type(loc) == "table" then loc = loc[1] end
       if not loc:match("^%w+://") then
         local scheme, host, port = parse_url(url)
         local base = scheme .. "://" .. host
@@ -402,14 +454,13 @@ function M.request(opts)
         loc = base .. loc
       end
       url = loc
-      -- 303 (and commonly 301/302 for POST) switch to GET
       if resp.status == 303 or ((resp.status == 301 or resp.status == 302)
           and (method or opts.method or "GET"):upper() == "POST") then
         method = "GET"
         opts.body = nil
       end
     else
-      return resp
+      return complete(resp, err)
     end
   end
 end

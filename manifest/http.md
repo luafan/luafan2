@@ -6,15 +6,19 @@ webase applications and standalone tools.  It exposes verb helpers
 `request{}` and picks one of two backends:
 
 * **C backend** — libcurl-based; single-hop from C, redirect loop lives
-  in the shim.  Enabled when the process links `libcurl`.
-* **Lua backend** — pure-Lua HTTP/1.1 over `fan.tcp`; chunked reader
-  + redirect handling in `fan/http_lua.lua`.  Always available; used
-  when the C backend is absent, when the caller pins with
-  `_G.__FAN_HTTP_BACKEND_DEFAULT = "lua"`, or when `opts.backend =
-  "lua"` is passed per call.
+  in the shim. Enabled when the process links `libcurl`.
+* **Lua backend** — pure-Lua HTTP/1.1 over `fan.tcp`; chunked reader,
+  redirects, v1 repeated-header arrays, upload callbacks, completion
+  callbacks, and response aliases live in `fan/http_lua.lua`. Always
+  available; used when the C backend is absent, when the caller pins with
+  `_G.__FAN_HTTP_BACKEND_DEFAULT = "lua"`, or when `opts.backend = "lua"`
+  is passed per call.
 
-Both backends return the **same response shape** so the shim is
-transparent to callers.
+Both backends return the same core response shape. C-only transport
+parameters that require libcurl or native per-request socket/TLS controls
+(such as custom DNS servers, proxy credentials/tunnel, client certificates,
+`resolve`, and detailed transfer timings) remain unavailable on the
+pure-Lua fallback and are not silently emulated.
 
 ## Response shape
 
