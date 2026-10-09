@@ -66,6 +66,7 @@ static lua_State  *g_main_L    = NULL;
 static CURLM      *g_multi     = NULL;
 static struct event *g_timer   = NULL;      /* CURLMOPT_TIMERFUNCTION drives it */
 static int         g_ncurrent  = 0;         /* outstanding request count */
+static int         g_shutting_down = 0;     /* defer multi cleanup until requests drain */
 
 /* ---- curl_easy_cleanup debug probe --------------------------------------
  * We are chasing a flaky "double free or corruption (!prev)" glibc abort
@@ -233,6 +234,7 @@ static void push_headers_table(lua_State *L, const char *hbuf, size_t hlen);
 /* ---- lazy init ---------------------------------------------------------- */
 static int ensure_multi(lua_State *L) {
     if (g_multi) return 0;
+    g_shutting_down = 0;
     /* curl_global_init is thread-hostile: call it once, before any threads,
      * from the main state at register-time (fan_http_register does it). We
      * only need to build the multi handle + timer event here. */
@@ -258,6 +260,17 @@ static void sock_ctx_free(sock_ctx_t *sc) {
     if (!sc) return;
     if (sc->ev) { event_del(sc->ev); event_free(sc->ev); sc->ev = NULL; }
     free(sc);
+}
+
+static void cleanup_multi_if_idle(void) {
+    if (!g_shutting_down || g_ncurrent != 0 || !g_multi) return;
+    if (g_timer) {
+        evtimer_del(g_timer);
+        event_free(g_timer);
+        g_timer = NULL;
+    }
+    curl_multi_cleanup(g_multi);
+    g_multi = NULL;
 }
 
 /* Called by libcurl any time it wants to add/modify/remove a poll on a
@@ -474,6 +487,11 @@ static void check_multi_info(void) {
         if (r->resolve) { curl_slist_free_all(r->resolve); r->resolve = NULL; }
         if (r->body_copy)   { free(r->body_copy); r->body_copy = NULL; }
         r->body_len = 0;
+        /* Response buffers are no longer needed after their contents have
+         * been copied onto the Lua stack. Release them here rather than
+         * retaining them until the request userdata is garbage-collected. */
+        if (r->resp_body) { evbuffer_free(r->resp_body); r->resp_body = NULL; }
+        if (r->resp_headers) { evbuffer_free(r->resp_headers); r->resp_headers = NULL; }
         /* Release callback refs only while the Lua registry is alive. */
         if (lua_alive && r->onreceive_ref != LUA_NOREF) luaL_unref(g_main_L, LUA_REGISTRYINDEX, r->onreceive_ref);
         r->onreceive_ref = LUA_NOREF;
@@ -502,6 +520,7 @@ static void check_multi_info(void) {
             fan_coro_wake(g_main_L, co, ref, nrets);
         }
     }
+    cleanup_multi_if_idle();
 }
 
 /* ---- M20.2: header-parse helpers shared by cb_header (early dispatch) and
@@ -1213,11 +1232,12 @@ void fan_http_register(lua_State *L) {
 }
 
 void fan_http_clear_lua_state(void) {
-    /* Companion to fan_http_register — clear the cached main-thread pointer
-     * before lua_close so late libcurl multi socket callbacks that resume
-     * parked coroutines via fan_coro_wake see NULL and drop the wake. See
-     * runtime/coro.h for the runtime-wide teardown contract. */
+    /* Stop Lua callbacks first. Pending transfers remain on the multi until
+     * the event loop drains them; the last completion then frees the timer
+     * and multi handle through cleanup_multi_if_idle(). */
     g_main_L = NULL;
+    g_shutting_down = 1;
+    cleanup_multi_if_idle();
 }
 
 #else   /* !FAN_WITH_CURL */
