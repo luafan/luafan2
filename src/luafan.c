@@ -51,6 +51,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 
 #define FAN2_VERSION "2.0.0-dev"
 
@@ -369,6 +370,30 @@ static const luaL_Reg fan2lib[] = {
 };
 
 int luaopen_fan(lua_State *L) {
+    /* Ignore SIGPIPE globally. A libevent bufferevent (fan.tcp / fan.http
+     * / fan.httpd / fan.ws) that writes to a socket whose peer has closed
+     * would otherwise take the default SIGPIPE action and terminate the
+     * host process:
+     *
+     *   - Linux: libevent uses write()/send() without MSG_NOSIGNAL, and
+     *     we do not set SO_NOSIGPIPE (that is BSD-only).
+     *   - macOS: no MSG_NOSIGNAL, SO_NOSIGPIPE is also not applied.
+     *
+     * The `fan` CLI already does this in main() (src/main.c), but when
+     * fan.so is dlopen'd by an arbitrary Lua host — notably the
+     * `/usr/local/bin/lua core.lua` entrypoint used by the Linux Docker
+     * image — that main() never runs. Doing it inside luaopen_fan
+     * guarantees every host that `require "fan"` gets the ignore before
+     * the first bufferevent is created. signal() is idempotent, so
+     * calling it on every require (including per-state inits) is safe.
+     *
+     * Do NOT replace this with a signal callback that calls
+     * fan.loopbreak()/event_base_loopbreak(): SIGPIPE is a per-socket
+     * write failure and must stay local to the connection's
+     * ondisconnected callback. Breaking the global loop here would turn
+     * one dead upstream into a full-process restart. */
+    signal(SIGPIPE, SIG_IGN);
+
     FAN_REGISTER(L, "fan", fan2lib);
     lua_pushliteral(L, FAN2_VERSION);
     lua_setfield(L, -2, "_VERSION");
