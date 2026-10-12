@@ -135,7 +135,7 @@ Design notes and CI/release workflow layout live in
   message layer over `fan.udp`: fragmentation/reassembly, sliding send/recv window,
   cumulative + SACK acks, timeout retransmission, out-of-order/duplicate tolerance,
   window flow control, idle session sweep. arm1/ARM64: udp 8/8, dns 6/6,
-  reliable_udp 8/8 (incl. 30%% loss recovery, reorder/dup, flow control), leaked=0.
+  reliable_udp 10/10 (incl. exact-boundary fragmentation, 30%% loss recovery, reorder/dup, flow control), leaked=0.
 - **M4 (TLS + HTTP + WebSocket + zlib)**: DONE.
   - TLS client — `net/tls.c` wraps `bufferevent_openssl_socket_new`;
     `fan.tcp.connect{ssl=true, verify_peer, verify_host}` reuses the tcp
@@ -146,12 +146,13 @@ Design notes and CI/release workflow layout live in
     Content-Length, close-framed bodies, 301/302/303/307/308 redirects
     (303 + POST->GET body drop), per-request connection isolation, TLS
     via `https://`.
-  - HTTP/1.1 server — `lua/fan/httpd.lua`, pure Lua on `fan.tcp.bind`.
-    Request parsing (path/query/headers/body), one-shot `resp:reply`
-    (auto Content-Length + `Connection: close`) and streaming
-    `reply_start`/`reply_chunk`/`reply_end` (chunked TE). Handler-error
-    contract: parse failure -> 400; handler crash -> 500; empty
-    handler -> 204; unfinished chunked mode auto-terminates.
+  - HTTP/1.1 server — `lua/fan/httpd.lua`, pure Lua on `fan.tcp.bind`, or
+    the evhttp C backend. Request parsing (path/query/headers/body), one-shot
+    `resp:reply` and streaming `reply_start`/`reply_chunk`/`reply_end` are
+    available on the supported backend surfaces. Both backends expose
+    `req:remoteinfo()` plus `req.remoteip` and `req.remoteport`; unavailable
+    peers return nil. Handler-error contract: parse failure -> 400; handler
+    crash -> 500; empty handler -> 204; unfinished chunked mode auto-terminates.
   - HTTPS server — TLS server-side bufferevent
     (`fan_tls_server_ctx_new`/`fan_tls_server_bev`, `BUFFEREVENT_SSL_ACCEPTING`)
     threaded through `fan.tcp.bind{ssl=true, cert, key}` and

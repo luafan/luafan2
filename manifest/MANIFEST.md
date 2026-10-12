@@ -77,3 +77,4 @@ not planning notes.
 - [Coverage plumbing](coverage.md) — how the three test modes
   (normal / --asan / --coverage) work; luacov `.luacov` layout;
   gcov / lcov invocation flow.
+- [HTTPD remote peer information](httpd-peer.md) — request peer IP and port for Lua and C HTTPD backends.

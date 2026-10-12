@@ -86,6 +86,28 @@ s:test("GET: method/path/query/headers/body parsed via C backend", function()
   T.truthy(resp.body:find("V=1.1",     1, true), resp.body)
 end)
 
+s:test("C backend: request exposes remote peer information", function()
+  local PORT = 25406
+  local server, resp
+  run(function()
+    server = assert(httpd.bind{
+      port = PORT, backend = "c",
+      handler = function(req, r)
+        local info = assert(req:remoteinfo())
+        r:reply(200, {}, info.ip .. ":" .. info.port .. "|" .. req.remoteip .. ":" .. req.remoteport)
+      end,
+    })
+    resp = http.get(BASE .. PORT .. "/peer")
+  end)
+  if server then server:close() end
+  T.eq(resp.status, 200)
+  local ip1, port1, ip2, port2 = resp.body:match("([^:]+):(%d+)|([^:]+):(%d+)$")
+  T.eq(ip1, "127.0.0.1")
+  T.eq(ip2, ip1)
+  T.eq(port2, port1)
+  T.truthy(tonumber(port1) > 0)
+end)
+
 s:test("POST body reaches the handler via req.body", function()
   local PORT = 25402
   local server, resp

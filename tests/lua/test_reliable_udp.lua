@@ -214,6 +214,56 @@ local function make_link(policy)
   return link
 end
 
+s:test("fragmentation preserves exact full-body boundary", function()
+  local body = 1200 - 9
+  local payload = string.rep("B", body * 3)
+  local got
+  run(function()
+    local link = make_link({})
+    local srv = ru.new_registry(nil, { rto = 0.05, mtu = 1200 })
+    local cli = ru.new_registry(nil, { rto = 0.05, mtu = 1200 })
+    srv.sock = link:socket("srv", 1)
+    cli.sock = link:socket("cli", 1)
+    link:register("srv", 1, srv)
+    link:register("cli", 1, cli)
+
+    fan.spawn(function() srv:run_ticker(0.02) end)
+    fan.spawn(function() cli:run_ticker(0.02) end)
+    fan.spawn(function() got = srv:session("cli", 1):recv() end)
+
+    assert(cli:session("srv", 1):send(payload))
+    local deadline = fan.gettime() + 4
+    while got == nil and fan.gettime() < deadline do fan.sleep(0.02) end
+    srv:stop(); cli:stop()
+  end)
+  T.eq(got, payload)
+end)
+
+s:test("fragmentation preserves one-byte tail after full boundary", function()
+  local body = 1200 - 9
+  local payload = string.rep("C", body * 2) .. "!"
+  local got
+  run(function()
+    local link = make_link({})
+    local srv = ru.new_registry(nil, { rto = 0.05, mtu = 1200 })
+    local cli = ru.new_registry(nil, { rto = 0.05, mtu = 1200 })
+    srv.sock = link:socket("srv", 1)
+    cli.sock = link:socket("cli", 1)
+    link:register("srv", 1, srv)
+    link:register("cli", 1, cli)
+
+    fan.spawn(function() srv:run_ticker(0.02) end)
+    fan.spawn(function() cli:run_ticker(0.02) end)
+    fan.spawn(function() got = srv:session("cli", 1):recv() end)
+
+    assert(cli:session("srv", 1):send(payload))
+    local deadline = fan.gettime() + 4
+    while got == nil and fan.gettime() < deadline do fan.sleep(0.02) end
+    srv:stop(); cli:stop()
+  end)
+  T.eq(got, payload)
+end)
+
 s:test("recovers from 30%% frame loss via retransmission", function()
   local got
   local msg = string.rep("XYZ", 2000)  -- forces many fragments

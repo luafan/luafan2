@@ -109,6 +109,12 @@ typedef struct {
      * the underlying object) OR by server:close() invalidation. */
     struct evhttp_request *ev;
 
+    /* Peer address is copied while evhttp owns the connection. Keeping a
+     * private copy lets request fields remain safe after libevent detaches
+     * the request during reply completion. */
+    char *remoteip;
+    ev_uint16_t remoteport;
+
     /* Body cache: evhttp buffered the entire request body before calling
      * gencb, so we drain it once into `body` and expose it via :read /
      * :available / :body. Length is `body_len`; the read cursor is
@@ -375,6 +381,14 @@ static httpd_request_t *request_push_new(lua_State *L, struct evhttp_request *ev
     memset(r, 0, sizeof(*r));
     r->ev = ev;
     r->body_pos = 1;                 /* 1-based, matches v1 Lua backend */
+    struct evhttp_connection *evcon = evhttp_request_get_connection(ev);
+    if (evcon) {
+        char *address = NULL;
+        ev_uint16_t port = 0;
+        evhttp_connection_get_peer(evcon, &address, &port);
+        if (address) r->remoteip = strdup(address);
+        r->remoteport = port;
+    }
     /* evkeyvalq requires an explicit init before add/find/remove — memset
      * to zero is not enough on all libevent versions. TAILQ_INIT is a
      * macro from <sys/queue.h> pulled in via evhttp headers. */
@@ -499,6 +513,13 @@ static void request_fill_fields(lua_State *L, int req_idx, struct evhttp_request
         lua_pushliteral(L, "");
     }
     lua_setfield(L, -2, "body");
+
+    if (r->remoteip) {
+        lua_pushstring(L, r->remoteip);
+        lua_setfield(L, -2, "remoteip");
+        lua_pushinteger(L, r->remoteport);
+        lua_setfield(L, -2, "remoteport");
+    }
 
     /* Stash uv onto the userdata. In Lua 5.2+ this is the sole uservalue;
      * we then use __index to read from it in the method metatable. */
@@ -1196,9 +1217,24 @@ static int l_req_query_values(lua_State *L) {
 
 /* __gc: free the body buffer and any un-flushed pending headers. Do not
  * touch r->ev — libevent owns it. */
+static int l_req_remoteinfo(lua_State *L) {
+    httpd_request_t *r = check_request(L, 1);
+    if (!r->remoteip) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_newtable(L);
+    lua_pushstring(L, r->remoteip);
+    lua_setfield(L, -2, "ip");
+    lua_pushinteger(L, r->remoteport);
+    lua_setfield(L, -2, "port");
+    return 1;
+}
+
 static int req_gc(lua_State *L) {
     httpd_request_t *r = check_request(L, 1);
     if (r->body) { free(r->body); r->body = NULL; }
+    if (r->remoteip) { free(r->remoteip); r->remoteip = NULL; }
     if (r->pending_headers_init) {
         evhttp_clear_headers(&r->pending_headers);
         r->pending_headers_init = 0;
@@ -1210,6 +1246,7 @@ static const luaL_Reg request_methods[] = {
     {"available",             l_req_available},
     {"query_values",          l_req_query_values},
     {"read",                  l_req_read},
+    {"remoteinfo",            l_req_remoteinfo},
     {"reply",                 l_req_reply},
     {"addheader",             l_req_addheader},
     {"reply_start",           l_req_reply_start},

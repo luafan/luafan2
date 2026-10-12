@@ -210,7 +210,17 @@ local function parse_request(reader)
     body = body,
     http_version = ver,
     _body_pos = 1,
+    _remoteip = nil,
+    _remoteport = nil,
   }
+  function req:remoteinfo()
+    if not self._remoteip then return nil end
+    return { ip = self._remoteip, port = self._remoteport }
+  end
+  function req:_set_remoteinfo(ip, port)
+    self._remoteip = ip
+    self._remoteport = port
+  end
   function req:available()
     return #self.body - (self._body_pos - 1)
   end
@@ -482,15 +492,16 @@ local function serve_one(handler, conn)
     pcall(resp.reply, resp, 400, { ["Content-Type"] = "text/plain" }, msg)
     return
   end
-  -- v1 parity: expose the peer address on the request. v1 called this
-  -- `req.remoteip`; we surface the same name plus `remote_addr`, which
-  -- webase and other v1-era apps also read. getpeername may fail on a
-  -- half-closed socket — in that case we leave both fields nil so
-  -- authorisation checks fall through to header-based fallbacks.
-  local peer_ok, peer_ip = pcall(function() return conn:getpeername() end)
-  if peer_ok and peer_ip then
-    req.remoteip    = peer_ip
-    req.remote_addr = peer_ip
+  -- v1 parity: expose the peer address on the request. getpeername may fail
+  -- on a half-closed socket; leave all peer fields nil in that case.
+  local peer_ok, remoteip, remoteport = pcall(function()
+    return conn:getpeername()
+  end)
+  if peer_ok and remoteip then
+    req:_set_remoteinfo(remoteip, remoteport)
+    req.remoteip = remoteip
+    req.remoteport = remoteport
+    req.remote_addr = remoteip
   end
   -- Stash the response on the request so v1 :websocket_accept() (which
   -- takes no arguments) can find it. Kept as an internal field.

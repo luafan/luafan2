@@ -129,9 +129,14 @@ The three v2 divergences are documented inline:
 
 ## Tests
 
+`tests/lua/test_udp.lua` treats unavailable IPv6 loopback and multicast
+loopback delivery as environment limitations. The multicast case has a
+finite watchdog so a host/container that accepts membership but drops
+loopback packets cannot hang the complete suite; delivery is still
+asserted when the environment provides it.
+
 `tests/lua/test_udp_async.lua` (15 cases) — all three modes green
-(normal / --asan / --coverage; C 85.4%, Lua 90.43%).  Covers happy
-path (self+data+dest), pre-connect send queue equivalent (send with
-default host:port), send_req+onsendready, getPort, rebind, close
-idempotence, three rejection paths, silent-drain when onread is
-unset, and the fan.udpd shim.
+(normal / --asan / --coverage; C 85.4%, Lua 90.43%). Covers happy path
+(self+data+dest), default-destination send, send_req+onsendready,
+getPort, rebind, close idempotence, rejection paths, silent-drain when
+onread is unset, and the fan.udpd shim.

@@ -61,6 +61,29 @@ s:test("Lua backend: GET method/path/query/headers/body round-trip", function()
   T.eq(resp.body, "GET /x query=a=1&a=42 a=42 values=1,42")
 end)
 
+s:test("Lua backend: request exposes remote peer information", function()
+  local PORT = 25606
+  local server, resp
+  run(function()
+    server = assert(httpd.bind{
+      port = PORT,
+      handler = function(req, r)
+        local info = assert(req:remoteinfo())
+        r:reply(200, { ["Content-Type"] = "text/plain" },
+          info.ip .. ":" .. info.port .. "|" .. req.remoteip .. ":" .. req.remoteport)
+      end,
+    })
+    resp = http.get(BASE .. PORT .. "/peer")
+  end)
+  if server then server:close() end
+  T.eq(resp.status, 200)
+  local ip1, port1, ip2, port2 = resp.body:match("([^:]+):(%d+)|([^:]+):(%d+)$")
+  T.eq(ip1, "127.0.0.1")
+  T.eq(ip2, ip1)
+  T.eq(port2, port1)
+  T.truthy(tonumber(port1) > 0)
+end)
+
 s:test("Lua backend: chunked reply_start/chunk/end streams data", function()
   local PORT = 25602
   local server, resp
