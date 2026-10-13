@@ -21,9 +21,9 @@
 #include <stdio.h>
 #include <stdlib.h>             /* getenv */
 
-/* Process-wide client context. Created lazily, freed at process exit by the
- * OS; there is exactly one, so this is a bounded, intentional singleton (not a
- * per-connection leak — the v2 rule is "no unbounded static growth"). */
+/* Process-wide default client context. The context owns a cache reference
+ * only while at least one client SSL lease is active; it is released when the
+ * last client bufferevent closes. */
 static SSL_CTX *g_client_ctx = NULL;
 
 /* M21.1 — File-scope error buffer.  fan_tls_client_bev_ex writes its detailed
@@ -183,10 +183,10 @@ static int fan_tls_load_pkcs12(SSL_CTX *ctx, const char *path, const char *pw) {
  *     diversity is small so linear probing is fine.  If the table saturates
  *     we fall back to un-cached ctx (still safe, just loses the reuse
  *     benefit) rather than evicting live entries.
- *   - Lifetime = process.  ctx entries are never freed; freeing a cached
- *     ctx while another connection still owns an SSL derived from it would
- *     UAF the SSL.  This is intentionally identical to how g_client_ctx is
- *     managed.
+ *   - Lifetime = active leases.  Each cache entry owns one SSL_CTX reference
+ *     while one or more client SSL objects use it.  When the last client
+ *     bufferevent closes, the cache reference is released and the entry is
+ *     removed. OpenSSL's SSL reference keeps the context alive during close.
  *   - Concurrency = the entire runtime is single-threaded (fan_loop is one
  *     event_base); no lock needed.  If v2 ever grows a threaded worker
  *     model this cache would need a mutex.
@@ -195,8 +195,13 @@ static int fan_tls_load_pkcs12(SSL_CTX *ctx, const char *path, const char *pw) {
 typedef struct {
     unsigned char fp[32];  /* SHA-256 digest */
     int           used;    /* 0 = empty slot */
-    SSL_CTX      *ctx;
+    unsigned int  active;  /* live client SSL objects using this ctx */
+    SSL_CTX      *ctx;     /* cache owns one reference while used */
 } tls_ctx_cache_slot_t;
+
+/* The default context is also leased: it is not retained after its last
+ * client SSL closes. */
+static unsigned int g_client_ctx_active = 0;
 static tls_ctx_cache_slot_t g_ctx_cache[TLS_CTX_CACHE_CAP];
 
 static void fan_tls_fingerprint(unsigned char out[32],
@@ -235,9 +240,9 @@ static SSL_CTX *fan_tls_ctx_cache_lookup(const unsigned char fp[32],
         int slot = (h + i) % TLS_CTX_CACHE_CAP;
         if (!g_ctx_cache[slot].used) {
             if (first_empty < 0) first_empty = slot;
-            /* Empty slot terminates the probe chain: the target is not
-             * present (insertions never leave a gap before their slot). */
-            break;
+            /* Released entries leave holes, so lookup must continue scanning
+             * the full table rather than terminating at the first hole. */
+            continue;
         }
         if (memcmp(g_ctx_cache[slot].fp, fp, 32) == 0) {
             if (empty_slot) *empty_slot = -1;
@@ -253,7 +258,75 @@ static void fan_tls_ctx_cache_insert(int slot, const unsigned char fp[32],
     if (slot < 0 || slot >= TLS_CTX_CACHE_CAP) return;
     memcpy(g_ctx_cache[slot].fp, fp, 32);
     g_ctx_cache[slot].ctx = ctx;
+    g_ctx_cache[slot].active = 0;
     g_ctx_cache[slot].used = 1;
+}
+
+static void fan_tls_release_ctx_owner(SSL_CTX *ctx) {
+    if (!ctx) return;
+    if (ctx == g_client_ctx) {
+        if (g_client_ctx_active > 0) g_client_ctx_active--;
+        if (g_client_ctx_active == 0) {
+            SSL_CTX_free(g_client_ctx);
+            g_client_ctx = NULL;
+        }
+        return;
+    }
+    for (int i = 0; i < TLS_CTX_CACHE_CAP; i++) {
+        tls_ctx_cache_slot_t *slot = &g_ctx_cache[i];
+        if (!slot->used || slot->ctx != ctx) continue;
+        if (slot->active > 0) slot->active--;
+        if (slot->active == 0) {
+            SSL_CTX_free(slot->ctx);
+            memset(slot, 0, sizeof(*slot));
+        }
+        return;
+    }
+    /* Full-cache contexts release their construction owner immediately after
+     * SSL_new; SSL_free releases the final SSL-held reference. */
+}
+
+static int fan_tls_ctx_has_owner(SSL_CTX *ctx) {
+    if (!ctx) return 0;
+    if (ctx == g_client_ctx) return 1;
+    for (int i = 0; i < TLS_CTX_CACHE_CAP; i++) {
+        if (g_ctx_cache[i].used && g_ctx_cache[i].ctx == ctx) return 1;
+    }
+    return 0;
+}
+
+static void fan_tls_release_idle_ctx_owner(SSL_CTX *ctx) {
+    if (!ctx) return;
+    if (ctx == g_client_ctx) {
+        if (g_client_ctx_active == 0) {
+            SSL_CTX_free(g_client_ctx);
+            g_client_ctx = NULL;
+        }
+        return;
+    }
+    for (int i = 0; i < TLS_CTX_CACHE_CAP; i++) {
+        tls_ctx_cache_slot_t *slot = &g_ctx_cache[i];
+        if (!slot->used || slot->ctx != ctx) continue;
+        if (slot->active == 0) {
+            SSL_CTX_free(slot->ctx);
+            memset(slot, 0, sizeof(*slot));
+        }
+        return;
+    }
+}
+
+static void fan_tls_acquire_ctx_lease(SSL_CTX *ctx) {
+    if (!ctx) return;
+    if (ctx == g_client_ctx) {
+        g_client_ctx_active++;
+        return;
+    }
+    for (int i = 0; i < TLS_CTX_CACHE_CAP; i++) {
+        if (g_ctx_cache[i].used && g_ctx_cache[i].ctx == ctx) {
+            g_ctx_cache[i].active++;
+            return;
+        }
+    }
 }
 
 /* Build (and configure) a fresh client SSL_CTX from the optional TLS params.
@@ -291,11 +364,10 @@ static SSL_CTX *fan_tls_new_client_ctx(const char *cainfo, const char *capath,
             char why[FAN_TLS_ERR_BUFLEN];
             if (fan_tls_pop_last_error(why, sizeof why)) {
                 snprintf(g_tls_err_buf, sizeof g_tls_err_buf,
-                         "SSL_CTX_load_verify_locations(%s%s%s): %s",
-                         cainfo ? cainfo : "",
-                         (cainfo && capath) ? ", " : "",
-                         capath ? capath : "",
-                         why);
+                         "SSL_CTX_load_verify_locations(cainfo=%.*s capath=%.*s): %.*s",
+                         64, cainfo ? cainfo : "",
+                         64, capath ? capath : "",
+                         120, why);
             } else {
                 snprintf(g_tls_err_buf, sizeof g_tls_err_buf,
                          "SSL_CTX_load_verify_locations(%s%s%s) failed",
@@ -318,7 +390,7 @@ static SSL_CTX *fan_tls_new_client_ctx(const char *cainfo, const char *capath,
             char why[FAN_TLS_ERR_BUFLEN];
             if (fan_tls_pop_last_error(why, sizeof why)) {
                 snprintf(g_tls_err_buf, sizeof g_tls_err_buf,
-                         "PKCS12 load(%s): %s", pkcs12_path, why);
+                         "PKCS12 load(%.*s): %.*s", 96, pkcs12_path, 120, why);
                 if (err) *err = g_tls_err_buf;
             } else {
                 if (err) *err = "PKCS12 load / parse failed";
@@ -329,10 +401,9 @@ static SSL_CTX *fan_tls_new_client_ctx(const char *cainfo, const char *capath,
     }
 
     /* Insert into the cache so the next matching request reuses this ctx.
-     * If the cache saturated (empty_slot < 0) we still return the ctx but
-     * it will not be cached — the caller does not free it either, so it
-     * effectively leaks for the process lifetime.  In practice this is a
-     * non-issue given the cap. */
+     * A full cache is handled by the caller as an uncached temporary: its
+     * owner reference is released after SSL_new, while the SSL object keeps
+     * its own context reference until the bufferevent is closed. */
     if (empty_slot >= 0) fan_tls_ctx_cache_insert(empty_slot, fp, ctx);
     return ctx;
 }
@@ -351,13 +422,12 @@ struct bufferevent *fan_tls_client_bev_ex(struct event_base *base,
 
     /* The ctx we use is one of two bounded singletons (v1 parity):
      *
-     *   - No TLS options set → g_client_ctx (process-wide default).
+     *   - No TLS options set → g_client_ctx (default context with one cache
+     *     owner while active client SSL leases exist).
      *   - Any of cainfo / capath / pkcs12_path set → cached ctx keyed on
-     *     the (cainfo, capath, pkcs12_path, pkcs12_password) tuple.  See
-     *     the SSL_CTX cache section above: hits reuse an existing ctx,
-     *     misses build one and insert it.  Either way we do NOT free the
-     *     ctx here — the cache (or the g_client_ctx singleton) owns it
-     *     for the process lifetime. */
+     *     the parameter tuple. Hits reuse an entry; misses insert one when
+     *     space exists. The cache owner is released after the last client
+     *     SSL closes. */
     SSL_CTX *use_ctx = NULL;
     if (!cainfo && !capath && !pkcs12_path) {
         if (!g_client_ctx) { if (err) *err = "SSL_CTX init failed"; return NULL; }
@@ -368,10 +438,19 @@ struct bufferevent *fan_tls_client_bev_ex(struct event_base *base,
         if (!use_ctx) return NULL;
     }
 
+    int cache_owned = fan_tls_ctx_has_owner(use_ctx);
     SSL *ssl = SSL_new(use_ctx);
     if (!ssl) {
+        if (cache_owned) fan_tls_release_idle_ctx_owner(use_ctx);
+        else SSL_CTX_free(use_ctx);
         if (err) *err = "SSL_new failed";
         return NULL;
+    }
+    fan_tls_acquire_ctx_lease(use_ctx);
+    if (!cache_owned) {
+        /* The cache was full. The SSL now owns the remaining OpenSSL
+         * reference; release the temporary construction owner. */
+        SSL_CTX_free(use_ctx);
     }
 
     /* SNI + hostname verification use `ssl_host` if given, else `host`. */
@@ -390,6 +469,7 @@ struct bufferevent *fan_tls_client_bev_ex(struct event_base *base,
         BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
     if (!bev) {
         SSL_free(ssl);
+        if (cache_owned) fan_tls_release_ctx_owner(use_ctx);
         if (err) *err = "bufferevent_openssl_socket_new failed";
         return NULL;
     }
@@ -397,6 +477,16 @@ struct bufferevent *fan_tls_client_bev_ex(struct event_base *base,
     bufferevent_openssl_set_allow_dirty_shutdown(bev, 1);
 #endif
     return bev;
+}
+
+void fan_tls_client_bev_free(struct bufferevent *bev) {
+    if (!bev) return;
+    SSL *ssl = bufferevent_openssl_get_ssl(bev);
+    SSL_CTX *ctx = ssl ? SSL_get_SSL_CTX(ssl) : NULL;
+    /* Keep the cache owner until bufferevent_free releases SSL. This prevents
+     * the old context address from being reused before the lease is dropped. */
+    bufferevent_free(bev);
+    if (ctx) fan_tls_release_ctx_owner(ctx);
 }
 
 /* Legacy entry — kept for the existing coroutine-yielding fan.tcp.connect
@@ -423,18 +513,40 @@ void *fan_tls_server_ctx_new(const char *cert_path, const char *key_path,
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) { if (err) *err = "SSL_CTX_new (server) failed"; return NULL; }
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    if (SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1) {
-        if (err) *err = "SSL_CTX_use_certificate_chain_file failed";
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1 &&
+        SSL_CTX_use_certificate_file(ctx, cert_path, SSL_FILETYPE_PEM) != 1) {
+        char why[FAN_TLS_ERR_BUFLEN];
+        if (fan_tls_pop_last_error(why, sizeof why)) {
+            snprintf(g_tls_err_buf, sizeof g_tls_err_buf,
+                     "SSL_CTX_use_certificate_file(%.*s): %.*s", 96, cert_path, 120, why);
+            if (err) *err = g_tls_err_buf;
+        } else if (err) {
+            *err = "SSL_CTX certificate load failed";
+        }
         SSL_CTX_free(ctx);
         return NULL;
     }
     if (SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM) != 1) {
-        if (err) *err = "SSL_CTX_use_PrivateKey_file failed";
+        char why[FAN_TLS_ERR_BUFLEN];
+        if (fan_tls_pop_last_error(why, sizeof why)) {
+            snprintf(g_tls_err_buf, sizeof g_tls_err_buf,
+                     "SSL_CTX_use_PrivateKey_file(%.*s): %.*s", 96, key_path, 120, why);
+            if (err) *err = g_tls_err_buf;
+        } else if (err) {
+            *err = "SSL_CTX_use_PrivateKey_file failed";
+        }
         SSL_CTX_free(ctx);
         return NULL;
     }
     if (SSL_CTX_check_private_key(ctx) != 1) {
-        if (err) *err = "SSL_CTX_check_private_key failed";
+        char why[FAN_TLS_ERR_BUFLEN];
+        if (fan_tls_pop_last_error(why, sizeof why)) {
+            snprintf(g_tls_err_buf, sizeof g_tls_err_buf,
+                     "SSL_CTX_check_private_key(%.*s): %.*s", 96, key_path, 120, why);
+            if (err) *err = g_tls_err_buf;
+        } else if (err) {
+            *err = "SSL_CTX_check_private_key failed";
+        }
         SSL_CTX_free(ctx);
         return NULL;
     }
@@ -492,6 +604,9 @@ struct bufferevent *fan_tls_client_bev_ex(struct event_base *base,
     (void)cainfo; (void)capath; (void)pkcs12_path; (void)pkcs12_password;
     if (err) *err = "TLS not compiled in (build with -DFAN_WITH_OPENSSL=ON)";
     return NULL;
+}
+void fan_tls_client_bev_free(struct bufferevent *bev) {
+    if (bev) bufferevent_free(bev);
 }
 int fan_tls_client_verify_reason(void *ssl_ptr, char *buf, size_t buflen) {
     (void)ssl_ptr; (void)buf; (void)buflen;

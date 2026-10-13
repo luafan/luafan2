@@ -171,16 +171,18 @@ CDP / Remote Hands / other v1 downstreams can drop their private
 `fan.tls_client_bev_ex` looks up an SSL_CTX in a 64-slot open-address
 hash table keyed on a SHA-256 fingerprint of
 `(cainfo, capath, pkcs12_path, pkcs12_password)` with `0x1E` (ASCII RS)
-as the field separator.  Two connections with identical TLS parameters
-share a single ctx; total ctx count is bounded by the parameter-set
-count (typically 1–5 in real deployments), NOT by the connection
-count.  This is the memory fix over a naive per-conn `SSL_CTX_new`
-which would allocate tens of KB of parsed certs per connection.
+as the field separator. Two connections with identical TLS parameters
+share a single ctx while each live SSL holds an active lease.
 
-Cache entries live for the process; freeing them while a derived SSL
-is still in flight would UAF.  If the cache saturates (unlikely at
-64 slots) new ctxs are built without caching — safe but loses the
-reuse benefit.
+The cache owns one SSL_CTX reference only while its active lease count is
+non-zero. When the last client bufferevent closes, `bufferevent_free()` first
+releases the SSL, then the cache owner is released and the entry is removed.
+The default `g_client_ctx` follows the same rule. Released cache slots remain
+probe-transparent: lookup scans past holes created by removal. If the cache is
+full, a new context is uncached: its construction owner is released after SSL
+creation and the live SSL is the only remaining owner. This avoids
+process-lifetime retention while preserving safe OpenSSL reference-count
+ordering.
 
 Callers with **no** TLS options (`cainfo`, `capath`, `pkcs12` all
 NULL) short-circuit to a process-wide `g_client_ctx` singleton with
@@ -234,9 +236,20 @@ for the full story.
 ## Tests
 
 Contract-level assertions live in `tests/lua/test_tcp_async.lua`
-(41 cases) and `tests/lua/test_tcp.lua` (11 cases).  M21 TLS
-pinning + diagnostics are covered by
-`tests/lua/test_http_tls.lua` (9 cases; three of them exercise the
-tcp.c error surface directly via bad host / closed port / bad
-DNS).  All three modes green: normal / --asan / --coverage; C
-line coverage **85.5%**, Lua **90.58%**.
+(41 cases) and `tests/lua/test_tcp.lua` (11 cases). M21 TLS
+pinning + diagnostics are covered by `tests/lua/test_http_tls.lua`
+(9 cases; three exercise the tcp.c error surface directly via bad
+host / closed port / bad DNS). `tests/lua/test_tls_lifecycle.lua`
+adds five lease-focused cases: default-context close, custom-CA
+cache release, sync GC, async terminal disconnect, and async
+reconnect after peer EOF.
+
+On arm1, the normal full suite passed, including C unit 46/46,
+`test_tls_lifecycle.lua` 5/5, and the stock Lua fan.so smoke test.
+The C backend callback path uses the ABI-correct libcurl progress
+callback (`curl_off_t` for XFERINFO, legacy `double` only on older
+libcurl). The stress test also waits for all child requests and
+cleanup before the outer runner breaks the event loop; this prevents
+orphaned sleep timers and stale multi state. After the fix,
+`test_http_c.lua` passed 20 consecutive ASan/LSan runs, including
+`oncomplete`, `onprogress`, and `onsend`, with no sanitizer report.

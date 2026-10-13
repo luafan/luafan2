@@ -41,6 +41,7 @@
 /* ---- connection object ---------------------------------------------------- */
 typedef struct {
     struct bufferevent *bev;
+    int        tls_client;    /* client TLS lease is held by this connection */
     lua_State *co;      /* coroutine currently parked on this conn, or NULL */
     int        co_ref;  /* registry pin for the parked coroutine */
     int        self_ref;/* registry pin for this conn userdata (connect path) */
@@ -65,6 +66,7 @@ typedef struct {
 /* forward */
 static void conn_readcb(struct bufferevent *bev, void *arg);
 static void conn_eventcb(struct bufferevent *bev, short what, void *arg);
+static void conn_release_bev(tcp_conn_t *c);
 
 static void conn_set_err(tcp_conn_t *c, const char *msg) {
     free(c->err);
@@ -356,6 +358,7 @@ static int l_connect(lua_State *L) {
     }
 
     tcp_conn_t *c = conn_push_new(L, bev);  /* conn userdata now on L stack */
+    c->tls_client = use_ssl;
     c->co = L;
     c->co_ref = ref;
     c->connecting = 1;
@@ -369,6 +372,7 @@ static int l_connect(lua_State *L) {
     bufferevent_enable(bev, EV_READ | EV_WRITE);
 
     if (bufferevent_socket_connect_hostname(bev, dns, AF_UNSPEC, host, port) < 0) {
+        conn_release_bev(c);
         c->co = NULL; c->co_ref = LUA_NOREF;
         if (c->self_ref != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->self_ref); c->self_ref = LUA_NOREF; }
         luaL_unref(L, LUA_REGISTRYINDEX, ref);
@@ -413,7 +417,10 @@ static int l_receive(lua_State *L) {
         free(tmp);
         return 1;
     }
-    if (c->eof) { lua_pushnil(L); lua_pushstring(L, "eof"); return 2; }
+    if (c->eof) {
+        lua_pushnil(L); lua_pushstring(L, "eof");
+        return 2;
+    }
 
     /* park until the read/event callback satisfies us */
     int ref = fan_coro_park(L);
@@ -426,9 +433,15 @@ static int l_receive(lua_State *L) {
 /* Release the bev the conn is holding. Idempotent. */
 static void conn_release_bev(tcp_conn_t *c) {
     if (!c->bev) return;
-    bufferevent_free(c->bev);
+    if (c->tls_client) {
+        fan_tls_client_bev_free(c->bev);
+        c->tls_client = 0;
+    } else {
+        bufferevent_free(c->bev);
+    }
     c->bev = NULL;
 }
+
 
 /* write callback used only while draining a closing conn: when the output
  * buffer has fully flushed, free the bufferevent and release the drain pin. */
@@ -770,6 +783,7 @@ static int server_gc(lua_State *L) {
 
 typedef struct {
     struct bufferevent *bev;
+    int   tls_client;       /* current bev owns a client TLS lease */
     /* Reconnect uses these to rebuild the bev. */
     char *host;
     int   port;
@@ -825,6 +839,7 @@ typedef struct {
 /* forward */
 static void async_conn_readcb(struct bufferevent *bev, void *arg);
 static void async_conn_eventcb(struct bufferevent *bev, short what, void *arg);
+static void async_conn_release_bev(tcp_async_conn_t *c);
 static int  async_conn_rebuild_bev(tcp_async_conn_t *c, const char **err);
 
 /* Dispatch a callback: create a coroutine, push fn + args, resume + unref.
@@ -963,7 +978,7 @@ static void async_conn_connect_timer_cb(evutil_socket_t fd, short what, void *ar
     if (c->closed || c->connected || c->dispatched_disc) return;
     /* Tear down the pending bev — otherwise a later CONNECTED / ERROR event
      * would fire against a conn that has already dispatched disc. */
-    if (c->bev) { bufferevent_free(c->bev); c->bev = NULL; }
+    async_conn_release_bev(c);
     c->connecting = 0;
     async_fire_disc(c, "connect_timeout");
 }
@@ -991,6 +1006,9 @@ static void async_conn_eventcb(struct bufferevent *bev, short what, void *arg) {
         c->connecting = 0;
         c->connected = 0;
         async_conn_disarm_connect_timer(c);
+        /* The terminal event owns no future I/O. Release the client TLS lease
+         * before user code receives ondisconnected and may reconnect. */
+        async_conn_release_bev(c);
         async_fire_disc(c, reason);
     }
 }
@@ -998,6 +1016,17 @@ static void async_conn_eventcb(struct bufferevent *bev, short what, void *arg) {
 /* Build a fresh bufferevent for the async conn using the stored host/port and
  * SSL parameters. Used by both the initial connect and reconnect(). On failure
  * returns -1 and *err is set to a static message. */
+static void async_conn_release_bev(tcp_async_conn_t *c) {
+    if (!c->bev) return;
+    if (c->tls_client) {
+        fan_tls_client_bev_free(c->bev);
+        c->tls_client = 0;
+    } else {
+        bufferevent_free(c->bev);
+    }
+    c->bev = NULL;
+}
+
 static int async_conn_rebuild_bev(tcp_async_conn_t *c, const char **err) {
     struct event_base *base = fan_loop_current_base();
     /* M17-2: prefer a caller-supplied evdns_base (via `evdns = ...` in the
@@ -1021,6 +1050,7 @@ static int async_conn_rebuild_bev(tcp_async_conn_t *c, const char **err) {
         if (!bev) { if (err) *err = "bufferevent_socket_new failed"; return -1; }
     }
     c->bev = bev;
+    c->tls_client = c->use_ssl;
 
     /* M17-2: writecb only when onsendready is set.  Passing NULL as the
      * writecb slot to bufferevent_setcb avoids the (small) per-drain
@@ -1048,8 +1078,7 @@ static int async_conn_rebuild_bev(tcp_async_conn_t *c, const char **err) {
     }
 
     if (bufferevent_socket_connect_hostname(bev, dns, AF_UNSPEC, c->host, c->port) < 0) {
-        bufferevent_free(bev);
-        c->bev = NULL;
+        async_conn_release_bev(c);
         if (err) *err = "connect dispatch failed";
         return -1;
     }
@@ -1286,7 +1315,7 @@ static int l_async_close(lua_State *L) {
     /* M17-2: disarm the connect timer BEFORE freeing the bev so its callback
      * cannot fire against a torn-down conn. */
     async_conn_disarm_connect_timer(c);
-    if (c->bev) { bufferevent_free(c->bev); c->bev = NULL; }
+    async_conn_release_bev(c);
     /* v1 contract: close() also fires ondisconnected(self, "closed") — makes
      * downstream state-machine cleanup uniform (one path for both peer-driven
      * and local-driven disconnect). Skip if we already fired for another
@@ -1303,7 +1332,7 @@ static int l_async_reconnect(lua_State *L) {
      * from a clean slate.  The timer would otherwise be reused with a fresh
      * event_new inside rebuild_bev and we would leak the old one. */
     async_conn_disarm_connect_timer(c);
-    if (c->bev) { bufferevent_free(c->bev); c->bev = NULL; }
+    async_conn_release_bev(c);
     c->connecting = 0;
     c->connected = 0;
     c->dispatched_disc = 0;
@@ -1375,7 +1404,7 @@ static int async_conn_gc(lua_State *L) {
     /* M17-2: disarm the connect timer first so it cannot fire against a
      * conn whose registry refs are already unref'd. */
     async_conn_disarm_connect_timer(c);
-    if (c->bev) { bufferevent_free(c->bev); c->bev = NULL; }
+    async_conn_release_bev(c);
     /* Free every strdup'd string. */
     if (c->host)             { free(c->host);             c->host = NULL; }
     if (c->ssl_host)         { free(c->ssl_host);         c->ssl_host = NULL; }

@@ -224,7 +224,15 @@ static int    cb_socket(CURL *easy, curl_socket_t s, int what, void *up, void *s
 static int    cb_timer(CURLM *m, long timeout_ms, void *up);
 static size_t cb_write(char *ptr, size_t size, size_t nmemb, void *up);
 static size_t cb_header(char *ptr, size_t size, size_t nmemb, void *up);
-static int cb_progress(void *up, double dltotal, double dlnow, double ultotal, double ulnow);
+static int cb_progress_common(req_ctx_t *r, curl_off_t dltotal, curl_off_t dlnow,
+                              curl_off_t ultotal, curl_off_t ulnow);
+#if LIBCURL_VERSION_NUM >= 0x072000
+static int cb_progress_xfer(void *up, curl_off_t dltotal, curl_off_t dlnow,
+                            curl_off_t ultotal, curl_off_t ulnow);
+#else
+static int cb_progress_legacy(void *up, double dltotal, double dlnow,
+                              double ultotal, double ulnow);
+#endif
 static int invoke_oncomplete(lua_State *L, req_ctx_t *r);
 /* M20.2 header-parse helpers (defined after check_multi_info, forward-decl'd
  * here so check_multi_info's completion tail can call them). */
@@ -670,9 +678,9 @@ static size_t cb_write(char *ptr, size_t size, size_t nmemb, void *up) {
     return n;
 }
 
-static int cb_progress(void *up, double dltotal, double dlnow,
-                       double ultotal, double ulnow) {
-    req_ctx_t *r = (req_ctx_t *)up;
+static int cb_progress_common(req_ctx_t *r, curl_off_t dltotal,
+                              curl_off_t dlnow, curl_off_t ultotal,
+                              curl_off_t ulnow) {
     if (r->cancel_err || !g_main_L) return 1;
     lua_rawgeti(g_main_L, LUA_REGISTRYINDEX, r->onprogress_ref);
     lua_pushinteger(g_main_L, (lua_Integer)dltotal);
@@ -693,6 +701,20 @@ static int cb_progress(void *up, double dltotal, double dlnow,
     if (cancel) record_cancel(r, "onprogress callback canceled");
     return cancel ? 1 : 0;
 }
+
+#if LIBCURL_VERSION_NUM >= 0x072000
+static int cb_progress_xfer(void *up, curl_off_t dltotal, curl_off_t dlnow,
+                            curl_off_t ultotal, curl_off_t ulnow) {
+    return cb_progress_common((req_ctx_t *)up, dltotal, dlnow, ultotal, ulnow);
+}
+#else
+static int cb_progress_legacy(void *up, double dltotal, double dlnow,
+                              double ultotal, double ulnow) {
+    return cb_progress_common((req_ctx_t *)up, (curl_off_t)dltotal,
+                               (curl_off_t)dlnow, (curl_off_t)ultotal,
+                               (curl_off_t)ulnow);
+}
+#endif
 
 static size_t cb_header(char *ptr, size_t size, size_t nmemb, void *up) {
     req_ctx_t *r = (req_ctx_t *)up;
@@ -1067,10 +1089,13 @@ static int l_request(lua_State *L) {
     lua_getfield(L, 1, "onprogress");
     if (lua_isfunction(L, -1)) {
         r->onprogress_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-        curl_easy_setopt(r->easy, CURLOPT_XFERINFOFUNCTION, cb_progress);
+#if LIBCURL_VERSION_NUM >= 0x072000
+        curl_easy_setopt(r->easy, CURLOPT_XFERINFOFUNCTION, cb_progress_xfer);
         curl_easy_setopt(r->easy, CURLOPT_XFERINFODATA, r);
-        curl_easy_setopt(r->easy, CURLOPT_PROGRESSFUNCTION, cb_progress);
+#else
+        curl_easy_setopt(r->easy, CURLOPT_PROGRESSFUNCTION, cb_progress_legacy);
         curl_easy_setopt(r->easy, CURLOPT_PROGRESSDATA, r);
+#endif
         curl_easy_setopt(r->easy, CURLOPT_NOPROGRESS, 0L);
     } else if (lua_isnil(L, -1)) lua_pop(L, 1);
     else { lua_pop(L, 1); return luaL_error(L, "onprogress must be a function"); }

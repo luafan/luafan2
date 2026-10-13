@@ -668,7 +668,6 @@ s:test("socket-context stress: mixed concurrent batches and callback cancellatio
           results[#results + 1] = response.body
         end
         completed = completed + 1
-        if completed == total then fan.loopbreak() end
       end)
     end
     local deadline = fan.gettime() + 30

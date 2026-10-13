@@ -56,6 +56,11 @@ struct bufferevent *fan_tls_client_bev_ex(struct event_base *base,
                                           const char *pkcs12_password,
                                           const char **err);
 
+/* Release a client TLS bufferevent and its client SSL_CTX lease. The
+ * bufferevent must have been created by fan_tls_client_bev[_ex]. Plain or
+ * server-side bufferevents must use bufferevent_free() directly. */
+void fan_tls_client_bev_free(struct bufferevent *bev);
+
 /* M21.1 — Fill `buf` with the OpenSSL peer-verify reason for `ssl_ptr`
  * (opaque SSL *).  Returns 1 if buf populated (verify failed with a
  * known reason), 0 if the handshake succeeded or ssl is not a TLS
