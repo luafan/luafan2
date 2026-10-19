@@ -27,7 +27,9 @@ local safe_os = {
     getenv = os.getenv,
     time = os.time,
     date = os.date,
-    clock = os.clock,
+    clock = function()
+        error("os.clock is disabled in sandbox; use utils.gettime() for precise wall-clock time")
+    end,
     difftime = os.difftime,
 }
 local env = {os = safe_os, tonumber = tonumber, tostring = tostring}
