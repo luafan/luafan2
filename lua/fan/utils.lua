@@ -86,15 +86,9 @@ end
 
 -- ---------------------------------------------------------------------------
 -- gettime — thin passthrough to fan.gettime() so callers who imported the
--- v1 helper keep working.
---
--- Compat note: v1's fan.gettime() returned (sec, usec) as a wall-clock
--- gettimeofday(3) pair, and this helper collapsed them into one float.
--- luafan2's fan.gettime() already returns a single monotonic float second,
--- which is what every v1 caller of utils.gettime() actually wanted
--- (differences, timeouts, throttles). Callers that need Unix epoch
--- seconds should use os.time() instead — utils.gettime() is not the
--- right primitive for that in either v1 or v2.
+-- v1 helper keep working. Both APIs return Unix wall-clock seconds with
+-- sub-second precision; callers needing elapsed-time deadlines should use
+-- a separately captured timestamp and compare differences.
 -- ---------------------------------------------------------------------------
 function M.gettime()
     return fan.gettime()

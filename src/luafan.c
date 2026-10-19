@@ -4,7 +4,7 @@
  * M0 scope: pure, event-loop-independent utilities so the build/test harness
  * can be validated end-to-end under ASan on arm1 before the runtime core lands.
  *   fan.version()         -> "2.0.0-dev"
- *   fan.gettime()         -> monotonic seconds (double)
+ *   fan.gettime()         -> Unix wall-clock seconds (double)
  *   fan.data2hex(s)       -> upper-case hex string (v1 byte-for-byte); nil on non-string
  *   fan.hex2data(hex)     -> binary string (v1 permissive: len>>1 pairs; strtol semantics
  *                            silently map invalid hex digits to 0); nil on non-string
@@ -62,10 +62,10 @@
 #  define FAN_REGISTER(L, name, funcs)  do { luaL_register((L), (name), (funcs)); } while (0)
 #endif
 
-static double fan_monotonic_seconds(void) {
-#if defined(CLOCK_MONOTONIC)
+static double fan_unix_seconds(void) {
+#if defined(CLOCK_REALTIME)
     struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
         return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
     }
 #endif
@@ -78,7 +78,7 @@ static int l_version(lua_State *L) {
 }
 
 static int l_gettime(lua_State *L) {
-    lua_pushnumber(L, fan_monotonic_seconds());
+    lua_pushnumber(L, fan_unix_seconds());
     return 1;
 }
 

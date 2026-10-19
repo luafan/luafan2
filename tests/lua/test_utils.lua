@@ -3,7 +3,7 @@
 
   Coverage goals (target: >= 90% line coverage of lua/fan/utils.lua):
     - random_string: ungrouped, grouped, empty-count, error branches;
-    - gettime: monotonic-ish; well-typed float;
+    - gettime: Unix wall-clock value; well-typed float;
     - split: leading/trailing sep, empty input, multi-char pattern;
     - weakify_object: reads/writes forward; GC of target -> reads nil;
     - weakify: 1-arg / N-arg forms;
@@ -69,15 +69,15 @@ end)
 -- ---------------------------------------------------------------------------
 -- gettime
 -- ---------------------------------------------------------------------------
-s:test("gettime returns positive float", function()
+s:test("gettime returns Unix wall-clock seconds", function()
     local t = U.gettime()
     T.is_type(t, "number")
-    T.truthy(t > 0)
+    T.truthy(t > 1000000000)
+    T.truthy(math.abs(t - os.time()) < 5)
 end)
 
-s:test("gettime is monotonic within a tight loop", function()
+s:test("gettime advances within a tight loop", function()
     local t0 = U.gettime()
-    -- do some work; gettimeofday resolution is typ. microseconds.
     local sum = 0
     for i = 1, 100000 do sum = sum + i end
     local t1 = U.gettime()
