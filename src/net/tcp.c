@@ -1346,6 +1346,18 @@ static int l_async_close(lua_State *L) {
      * and local-driven disconnect). Skip if we already fired for another
      * reason (race between remote EOF and local close). */
     if (!c->dispatched_disc) async_fire_disc(c, "closed");
+    /* Release every Lua callback ref: close() is terminal — reconnect() checks
+     * c->closed and refuses, so no later dispatch will need these. Dropping
+     * them here breaks Lua-side upvalue cycles (callbacks that captured a
+     * table that in turn stores this conn) so the userdata can be collected
+     * without waiting for __gc, which itself needs the cycle broken first.
+     * The natural ondisconnected path (peer EOF / timeout) keeps the refs so
+     * reconnect() can rearm the same callbacks. */
+    if (c->on_connected_ref != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_connected_ref); c->on_connected_ref = LUA_NOREF; }
+    if (c->on_read_ref      != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_read_ref);      c->on_read_ref      = LUA_NOREF; }
+    if (c->on_sendready_ref != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_sendready_ref); c->on_sendready_ref = LUA_NOREF; }
+    if (c->on_disc_ref      != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->on_disc_ref);      c->on_disc_ref      = LUA_NOREF; }
+    if (c->evdns_ref        != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, c->evdns_ref);        c->evdns_ref        = LUA_NOREF; }
     return 0;
 }
 
