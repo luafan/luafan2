@@ -1162,6 +1162,12 @@ static int l_ws_receive(lua_State *L) { return l_ws_recv(L); }
  * free on the very readcb stack that's about to return. */
 static int l_ws_gc(lua_State *L) {
     fan_ws_conn_t *w = check_ws(L, 1);
+    if (w->co && w->co_ref != LUA_NOREF) {
+        int ref = w->co_ref;
+        w->co = NULL;
+        w->co_ref = LUA_NOREF;
+        fan_unref_safe(g_ws_main_L, ref);
+    }
     if (w->flags & WS_ST_EVCON_LIVE) {
         struct evhttp_connection *evcon = w->evcon;
         struct evhttp_request    *req   = w->ev_req;

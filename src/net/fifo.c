@@ -173,8 +173,21 @@ static int l_receive(lua_State *L) {
     return lua_yield(L, 0);
 }
 
+static void fifo_fail_parked(fifo_t *f, const char *msg) {
+    if (!f->co || f->co_ref == LUA_NOREF) return;
+    lua_State *co = f->co;
+    int ref = f->co_ref;
+    f->co = NULL;
+    f->co_ref = LUA_NOREF;
+    f->want = 0;
+    lua_pushnil(co);
+    lua_pushstring(co, msg ? msg : "closed");
+    fan_coro_wake(g_fifo_L, co, ref, 2);
+}
+
 static int l_close(lua_State *L) {
     fifo_t *f = (fifo_t *)luaL_checkudata(L, 1, FIFO_MT);
+    fifo_fail_parked(f, "closed");
     if (!f->closed && f->bev) { bufferevent_free(f->bev); f->bev = NULL; f->fd = -1; }
     f->closed = 1;
     return 0;
@@ -182,6 +195,13 @@ static int l_close(lua_State *L) {
 
 static int fifo_gc(lua_State *L) {
     fifo_t *f = (fifo_t *)luaL_checkudata(L, 1, FIFO_MT);
+    if (f->co && f->co_ref != LUA_NOREF) {
+        int ref = f->co_ref;
+        f->co = NULL;
+        f->co_ref = LUA_NOREF;
+        f->want = 0;
+        fan_unref_safe(g_fifo_L, ref);
+    }
     if (f->bev) { bufferevent_free(f->bev); f->bev = NULL; }
     free(f->err); f->err = NULL;
     return 0;

@@ -456,9 +456,22 @@ static void conn_drain_writecb(struct bufferevent *bev, void *arg) {
     }
 }
 
+static void conn_fail_parked(tcp_conn_t *c, const char *msg) {
+    if (!c->co || c->co_ref == LUA_NOREF) return;
+    lua_State *co = c->co;
+    int ref = c->co_ref;
+    c->co = NULL;
+    c->co_ref = LUA_NOREF;
+    c->want = 0;
+    lua_pushnil(co);
+    lua_pushstring(co, msg ? msg : "closed");
+    fan_coro_wake(g_main_L, co, ref, 2);
+}
+
 static int l_close(lua_State *L) {
     tcp_conn_t *c = (tcp_conn_t *)luaL_checkudata(L, 1, TCP_CONN_MT);
     if (c->closed || c->draining) return 0;
+    conn_fail_parked(c, "closed");
     if (c->bev) {
         /* if there is unsent output, drain it before freeing so the peer is not
          * cut off mid-message (avoids losing data on a send-then-close). */
@@ -481,6 +494,18 @@ static int l_close(lua_State *L) {
 
 static int conn_gc(lua_State *L) {
     tcp_conn_t *c = (tcp_conn_t *)luaL_checkudata(L, 1, TCP_CONN_MT);
+    if (c->co && c->co_ref != LUA_NOREF) {
+        int ref = c->co_ref;
+        c->co = NULL;
+        c->co_ref = LUA_NOREF;
+        c->want = 0;
+        fan_unref_safe(g_main_L, ref);
+    }
+    if (c->drain_self_ref != LUA_NOREF) {
+        int ref = c->drain_self_ref;
+        c->drain_self_ref = LUA_NOREF;
+        fan_unref_safe(g_main_L, ref);
+    }
     conn_release_bev(c);
     free(c->err); c->err = NULL;
     return 0;

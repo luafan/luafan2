@@ -310,6 +310,12 @@ static int l_close(lua_State *L) {
 
 static int udp_gc(lua_State *L) {
     udp_sock_t *u = (udp_sock_t *)luaL_checkudata(L, 1, UDP_MT);
+    if (u->co && u->co_ref != LUA_NOREF) {
+        int ref = u->co_ref;
+        u->co = NULL;
+        u->co_ref = LUA_NOREF;
+        fan_unref_safe(g_udp_L, ref);
+    }
     if (u->ev) { event_free(u->ev); u->ev = NULL; }
     if (u->fd >= 0) { close(u->fd); u->fd = -1; }
     return 0;
