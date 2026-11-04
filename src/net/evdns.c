@@ -88,11 +88,15 @@ static int l_create(lua_State *L) {
         return 2;
     }                                               /* LCOV_EXCL_STOP */
 
-    /* NB: EVDNS_BASE_INITIALIZE_NAMESERVERS reads /etc/resolv.conf up front.
-     * We *want* that behaviour: if the caller's custom list all fail to
-     * register we still want a functional resolver. We then clear+resume to
-     * replace with the caller's list. */
-    struct evdns_base *base = evdns_base_new(ev_base, EVDNS_BASE_INITIALIZE_NAMESERVERS);
+    /* By default initialize from the system nameservers, then replace them
+     * with the caller's list below. Network Extension targets can define
+     * EVDNS_BASE_NO_SYSTEM_NAMESERVERS to avoid reading /etc/resolv.conf. */
+#if defined(EVDNS_BASE_NO_SYSTEM_NAMESERVERS)
+    const int dnsInitFlags = 0;
+#else
+    const int dnsInitFlags = EVDNS_BASE_INITIALIZE_NAMESERVERS;
+#endif
+    struct evdns_base *base = evdns_base_new(ev_base, dnsInitFlags);
     if (!base) {                                    /* LCOV_EXCL_LINE */
         /* Fresh base creation failed entirely; fall back to default.
          * evdns_base_new only fails on OOM, so this is untestable. */

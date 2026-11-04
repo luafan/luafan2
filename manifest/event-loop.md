@@ -6,5 +6,10 @@ v1/webase contract for long-running servers. Call `fan.loopbreak()` to request
 shutdown. The callback form `fan.loop(fn, ...)` remains supported and starts
 the callback coroutine before entering the loop.
 
+When `EVDNS_BASE_NO_SYSTEM_NAMESERVERS` is defined, both the shared loop DNS
+base and custom `fan.evdns` bases skip automatic `/etc/resolv.conf` loading;
+callers must add nameservers explicitly. Without the macro, libevent's default
+system nameserver initialization is preserved.
+
 The runtime regression coverage is in `tests/lua/test_coro.lua`, including
 park/resume, concurrent sleeps, GC retention, and explicit `loopbreak()` exit.

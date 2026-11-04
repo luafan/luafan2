@@ -22,8 +22,12 @@ struct evdns_base *fan_loop_dnsbase(void) {
     if (FAN_UNLIKELY(g_dnsbase == NULL)) {
         struct event_base *base = fan_loop_base();
         if (!base) return NULL;
-        /* EVDNS_BASE_INITIALIZE_NAMESERVERS: read /etc/resolv.conf */
-        g_dnsbase = evdns_base_new(base, EVDNS_BASE_INITIALIZE_NAMESERVERS);
+#if defined(EVDNS_BASE_NO_SYSTEM_NAMESERVERS)
+        const int dnsInitFlags = 0;
+#else
+        const int dnsInitFlags = EVDNS_BASE_INITIALIZE_NAMESERVERS;
+#endif
+        g_dnsbase = evdns_base_new(base, dnsInitFlags);
         if (g_dnsbase) {
             /* Bound the worst case when a configured nameserver is unreachable
              * (e.g. a cloud metadata resolver that drops our packets): cap the
